@@ -1,0 +1,17 @@
+[package]
+name = "e2ee-proto"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+base64 = "0.23.1"
+hex = "0.4.3"
+prost = "0.14.5"
+serde = { version = "1.0.229", features = ["derive"] }
+sha2 = "0.11"
+voprf = { version = "0.5.0", features = ["ristretto255", "alloc"] }
+rand_core06 = { package = "rand_core", version = "0.6", features = ["getrandom"] }
+url = "2.5.8"
+libcrux-ml-dsa = { version = "0.0.11", default-features = false, features = ["std", "mldsa87"] }
+rusqlite = { version = "0.42.0", features = ["bundled"] }

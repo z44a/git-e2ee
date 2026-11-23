@@ -1,0 +1,36 @@
+[workspace]
+resolver = "3"
+members = ["crates/proto", "crates/core", "crates/relay", "crates/helper"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+# The oldest Rust the whole workspace is checked against. (1.93.x fails in
+# libcrux-platform, a dependency of the ML-DSA crate.)
+rust-version = "1.95"
+
+[workspace.dependencies]
+# Pinned to the v0.107.0 tag commit. Bump deliberately; libsignal's API is unstable.
+libsignal-protocol = { git = "https://github.com/signalapp/libsignal", rev = "0abcfd4044a5827d73b657c1170ab3638d660330" }
+
+e2ee-proto = { path = "crates/proto" }
+e2ee-core = { path = "crates/core" }
+e2ee-relay = { path = "crates/relay" }
+
+# Elliptic-curve and hash code is very slow unoptimized; keep debug builds
+# (and the test suite) fast without optimizing everything.
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+[profile.dev.package.voprf]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.libcrux-ml-kem]
+opt-level = 3
+[profile.dev.package.libcrux-ml-dsa]
+opt-level = 3
+[profile.dev.package.libcrux-sha3]
+opt-level = 3
+[profile.dev.package.libcrux-intrinsics]
+opt-level = 3
