@@ -2588,7 +2588,7 @@ impl Engine {
             report.warnings.push(format!(
                 "{who} added user {} to this repo; they receive everything pushed from now on{}",
                 short(&m.user_id),
-                if verified { "" } else { ". You haven't verified them: if you don't know who they are, ask, or verify them (`git e2ee verify`)" }
+                if verified { "" } else { ". They aren't one of your contacts: if you don't know who they are, ask the members" }
             ));
         }
         Ok(())
@@ -3469,7 +3469,11 @@ impl Engine {
             self.refresh_device_lists(std::slice::from_ref(&m.user_id), &mut warnings).await?;
             new_devices = self.dev.db.devices_of(&m.user_id)?;
             if new_devices.is_empty() {
-                bail!("no verified devices for that user on this relay; they must run `git e2ee register {}` first", self.relay_url);
+                bail!(
+                    "that user has no devices on this relay; they must create their account here first \
+                     (`git e2ee init-user {}`)",
+                    self.relay_url
+                );
             }
             roster.members.push(m.clone());
         }
@@ -3827,7 +3831,7 @@ impl Engine {
                 forget(self)?;
                 report.notes.push(format!(
                     "{}'s device {d} never cloned this repo; stopped re-sending the invitation. If they still \
-                     want access, run `git e2ee member add <their user code>` again",
+                     want access, run `git e2ee member add <their name>` again",
                     short(&u)
                 ));
             } else if now.saturating_sub(sent) >= resend {

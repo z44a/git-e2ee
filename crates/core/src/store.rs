@@ -111,7 +111,8 @@ const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v BLOB NOT NULL);
--- Master keys we trust. verified = 1 when the user compared safety numbers.
+-- Master keys we trust. verified = 1 for contacts (`git e2ee contact add`);
+-- 0 for members we only know from a repo's roster.
 CREATE TABLE IF NOT EXISTS pinned (user BLOB PRIMARY KEY, master_key BLOB NOT NULL, verified INTEGER NOT NULL, delivery_token BLOB);
 -- Unspent anonymous access tokens, per relay.
 CREATE TABLE IF NOT EXISTS access_tokens (nonce BLOB PRIMARY KEY, relay_url TEXT NOT NULL, epoch INTEGER NOT NULL, output BLOB NOT NULL, generation INTEGER NOT NULL DEFAULT 0);
@@ -429,6 +430,28 @@ impl Db {
         } else {
             self.conn().execute("INSERT OR REPLACE INTO contact_names (user, name) VALUES (?1, ?2)", params![user, name])?;
         }
+        Ok(())
+    }
+
+    /// Your contacts (`git e2ee contact add`): (user id, name), by name.
+    pub fn contacts(&self) -> Result<Vec<(Vec<u8>, String)>> {
+        let mut st = self.conn().prepare(
+            "SELECT p.user, COALESCE(n.name, '') FROM pinned p LEFT JOIN contact_names n ON n.user = p.user WHERE p.verified = 1 ORDER BY 2, 1",
+        )?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The users with this contact name (names are unique, so at most one).
+    pub fn user_named(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self.conn().query_row("SELECT user FROM contact_names WHERE name = ?1", [name.trim()], |r| r.get(0)).optional()?)
+    }
+
+    /// Stop treating this user as a contact: drop the name, and the pin too
+    /// unless a repo's roster still needs it.
+    pub fn remove_contact(&self, user: &[u8]) -> Result<()> {
+        self.conn().execute("DELETE FROM contact_names WHERE user = ?1", [user])?;
+        self.conn().execute("UPDATE pinned SET verified = 0 WHERE user = ?1", [user])?;
         Ok(())
     }
 

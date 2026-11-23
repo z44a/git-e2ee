@@ -25,10 +25,10 @@ How everything works, and every known limitation in detail, is in
 | ✅ | **Post-quantum confidentiality** | Traffic recorded today stays private even against a future quantum computer. |
 | ✅ | **Integrity** | The commit history (what `git log` shows) can't be altered: commits are content-addressed with SHA-256 (SHA-1 only if a repo opts in; see below). The relay can't change, forge, reorder or silently drop pushes without members noticing. Replace refs (`refs/replace/*`, which make git show other content for an existing commit) can't be pushed, so no member can use them to change what an already-pushed commit looks like to others. |
 | ✅ | **Consistency (fork and equivocation detection)** | Neither the relay nor a member can show different members different versions of the repo without being caught. |
-| ✅ | **Authentication** | Collaborators are verified once by safety number (digits, words or QR). Nobody can pass off a *push* as someone else's. Commit authors are a different matter (see **Commit authorship**). |
+| ✅ | **Authentication** | You add collaborators as contacts by the user id they send you over a channel you trust (a verified Signal chat, in person); the id is a hash of their key, so the relay can't substitute another. Nobody can pass off a *push* as someone else's. Commit authors are a different matter (see **Commit authorship**). |
 | ✅ | **Device-list integrity** | The relay can't add eavesdropping devices or hide additions and revocations. You're told whenever a collaborator's devices change. |
 | ✅ | **Post-quantum message authentication** | libsignal authenticates with Curve25519 only, so every pair of devices also runs a Kyber1024 (ML-KEM's predecessor, the version libsignal treats as stable) handshake, and each message is encrypted and authenticated again under the resulting key. Posing as someone's device, or reading their messages after taking over a session, takes breaking Kyber too. The handshake runs once per pair of devices, so its key is as long-lived as the devices' own keys (see post-compromise security below). It uses no signatures, so it stays deniable. The cost: a new member's or device's first messages to someone wait until that person has been online once. |
-| ✅ | **Post-quantum device lists and relay logins** | Master keys and relay request signatures are hybrid (Curve25519 plus ML-DSA-87), and safety numbers cover both. Even a quantum computer can't add a device to someone's account or act as their device toward the relay. |
+| ✅ | **Post-quantum device lists and relay logins** | Master keys and relay request signatures are hybrid (Curve25519 plus ML-DSA-87), and user ids cover both. Even a quantum computer can't add a device to someone's account or act as their device toward the relay. |
 | ✅ | **Forward secrecy** | Recorded ciphertext can't be decrypted with keys stolen later. |
 | ✅ | **Post-compromise security** | Covers session state: after a temporary compromise, access ends as the device keeps syncing. Not identity keys (see below). |
 | ✅ | **Deniability** | Collaborators know who pushed each change, but nobody can prove it to anyone else. Signed commits and tags are refused by default, including signed tags nested inside unsigned ones or merged into commits, and commits hidden behind `git replace`. |
@@ -268,21 +268,33 @@ cargo install --locked --path crates/relay    # git-e2ee-relay
 git e2ee init-user https://relay.example    # add --token <token> if the relay is invite-only
 ```
 
-This prints your user code (`e2eeu1:…`), which you share with collaborators.
+This prints your **user id** (64 hex characters; `git e2ee whoami` shows it again).
+Send it to your collaborators over a channel you trust, such as a verified Signal
+chat or in person.
 
 **Accounts are per relay.** Your account on another relay is a separate user, with
-its own master key, user code, devices and contacts, and the relays can't link the
-two. Collaborators on each relay verify that relay's code. A repo uses the account of
-its remote's relay. Commands that aren't about a repo (`whoami`, `verify`, `device
-…`) use the current repo's relay, or your only account; with several, pick one with
-`--relay <url>`. `git e2ee accounts` lists them.
+its own master key, user id, devices and contacts, and the relays can't link the
+two. Send collaborators the id of your account on the relay you share. A repo uses
+the account of its remote's relay. Commands that aren't about a repo (`whoami`,
+`contact`, `device …`) use the current repo's relay, or your only account; with
+several, pick one with `--relay <url>`. `git e2ee accounts` lists them.
 
-**2. Verify your collaborators.** Both of you run this, and compare the safety number
-in person or on a call:
+**2. Add your collaborators as contacts**, with the user id each sent you. Both of
+you do this, each adding the other:
 
 ```sh
-git e2ee verify e2eeu1:<their user code> --name Alice   # the name stays on your device
+git e2ee contact add Alice <alice's user id>    # the name stays on your device
 ```
+
+Add each other *before* one of you adds the other to a repo; then the first
+`git clone` works right away.
+
+**Why no safety numbers?** Signal has you compare safety numbers because you find
+people by phone number or username, which say nothing about their key: Signal's
+server hands you the key, and only comparing safety numbers shows it didn't hand you
+its own. Here you name people by their user id, which *is* a hash of their key, so
+the relay's answer is checked against what you were given and a substituted key is
+refused. (Get the id over a channel you trust, such as a verified Signal chat)
 
 **3. Create a repo** (SHA-256; for an existing SHA-1 repo see "SHA-1 repos" below):
 
@@ -293,10 +305,10 @@ git e2ee repo init https://relay.example    # adds the remote "origin"
 git push -u origin main
 ```
 
-**4. Add a collaborator**, who has registered and been verified:
+**4. Add a collaborator**, who is your contact (and has added you):
 
 ```sh
-git e2ee member add e2eeu1:<their user code>
+git e2ee member add Alice
 ```
 
 They clone with plain git (`member add` prints the command):
@@ -348,8 +360,8 @@ git e2ee device revoke <device id>
 
 | Task | Command |
 |---|---|
-| Add someone (verify them first) | `git e2ee member add <user code>` |
-| Remove someone | `git e2ee member remove <user code or id>` |
+| Add someone (a contact) | `git e2ee member add <name>` |
+| Remove someone | `git e2ee member remove <name or user id>` |
 | List members and their devices | `git e2ee member list` |
 | Limit how much mail someone you no longer work with can send you | `git e2ee rotate-delivery-token` |
 
@@ -357,7 +369,8 @@ git e2ee device revoke <device id>
 `git clone` with the URL you give them. The relay keeps an invitation for at least a
 week (up to two), so your device sends it again about weekly, whenever you use the
 repo, until they've cloned; `git e2ee status` shows who hasn't yet. If their clone says
-the history hasn't arrived, run `git e2ee member add <their code>` again: for someone
+the history hasn't arrived, check that they've added you as a contact, then run
+`git e2ee member add <their name>` again: for someone
 who hasn't cloned, it re-sends the invitation at once. Your device stops re-sending
 after two months.
 
@@ -369,7 +382,7 @@ device.) To drop a repo from one device but stay a member, use `git e2ee repo fo
 Your **delivery token** is only an anti-spam measure. Everyone you exchange messages
 with learns it, and mail that carries it skips the relay's small daily limit for
 strangers. It doesn't decrypt or authenticate anything: every message is still
-end-to-end encrypted and checked as coming from a verified device. A leaked token only
+end-to-end encrypted and checked as coming from a device of a known user. A leaked token only
 means more mail can reach your mailbox. Rotating it moves people you no longer send
 messages to back into the stranger limit; it doesn't block them completely. Rotation is
 manual for now.
@@ -378,10 +391,10 @@ manual for now.
 
 | Command | Purpose |
 |---|---|
-| `init-user <relay> [--token]`, `whoami` | Create your account on a relay; show its user code |
+| `init-user <relay> [--token]`, `whoami` | Create your account on a relay; show its user id |
 | `accounts` | List your accounts (one per relay) |
-| `verify <code> [--name <name>]` | Compare safety numbers and trust a collaborator |
-| `name <code or id> <name>` | Name a contact (only on this device); names are shown instead of user IDs |
+| `contact add <name> <user id>` | Add a collaborator by the user id they sent you over a trusted channel (adding again renames) |
+| `contact list`, `contact remove <name or id>` | List or remove contacts; names are local and shown instead of user ids |
 | `register <relay> [--token]` | Register this device with its account's relay again (e.g. with a token) |
 | `device link <relay> / approve / finish / revoke / list` | Manage your devices |
 | `repo init <relay> [--allow-sha1]` | Create a repo |

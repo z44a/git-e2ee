@@ -8,7 +8,6 @@ use e2ee_core::client::RelayClient;
 use e2ee_core::device::{Device, short};
 use e2ee_core::engine::Engine;
 use e2ee_core::git::Git;
-use e2ee_core::identity::{decode_user_code, encode_user_code, format_safety_number, safety_number};
 use e2ee_helper::{Session, has_account, print_report, print_warnings, runtime, printable};
 use e2ee_core::store::{account_dir, accounts, relay_host};
 use e2ee_proto::{Member, Message, user_id_of};
@@ -39,24 +38,10 @@ enum Cmd {
     Accounts,
     /// Show this account's code and id.
     Whoami,
-    /// Compare safety numbers with another user and pin their master key.
-    Verify {
-        user_code: String,
-        /// Skip the interactive confirmation (you compared out of band).
-        #[arg(long)]
-        yes: bool,
-        /// A name for this contact, shown instead of its user id. Stored only
-        /// on this device, never sent anywhere.
-        #[arg(long)]
-        name: Option<String>,
-    },
-    /// Give a contact a name (local only), shown instead of its user id.
-    /// An empty name removes it.
-    Name {
-        /// User code or hex user id.
-        user: String,
-        name: String,
-    },
+    /// Manage your contacts: the people you can add to repos and accept
+    /// invitations from.
+    #[command(subcommand)]
+    Contact(ContactCmd),
     /// Register this account's device with its relay again (say, with a
     /// token after the relay became invite-only). `init-user` and
     /// `device finish` register already.
@@ -125,6 +110,24 @@ enum Cmd {
 }
 
 #[derive(Subcommand)]
+enum ContactCmd {
+    /// Add a contact by the user id they sent you over a channel you trust
+    /// (a verified Signal chat, in person): that is what vouches for them.
+    /// Both of you add each other; then either can add the other to repos.
+    Add {
+        /// Your name for them (only on this device), used in commands and
+        /// shown instead of their user id.
+        name: String,
+        /// Their user id (`git e2ee whoami` shows it).
+        user_id: String,
+    },
+    /// List your contacts.
+    List,
+    /// Remove a contact (by name or user id). Repos they're in keep them.
+    Remove { contact: String },
+}
+
+#[derive(Subcommand)]
 enum DeviceCmd {
     /// On a new device: start joining your account on this relay; prints a
     /// link code to paste on the master device.
@@ -175,15 +178,16 @@ enum RepoCmd {
 
 #[derive(Subcommand)]
 enum MemberCmd {
-    /// Add a verified user and send them the history.
+    /// Add a contact and send them the history.
     Add {
-        user_code: String,
+        /// Contact name or user id.
+        user: String,
         #[command(flatten)]
         remote: RemoteArg,
     },
     /// Remove a user and rotate the repo secret.
     Remove {
-        /// User code or hex user id.
+        /// Contact name or user id.
         user: String,
         #[command(flatten)]
         remote: RemoteArg,
@@ -253,51 +257,10 @@ fn run(cli: Cli) -> Result<()> {
             if let Some(r) = &account_relay {
                 println!("relay:     {}", relay_host(r)?);
             }
-            println!("user id:   {}", hex::encode(&dev.user));
+            println!("user id:   {}  (send it to collaborators over a channel you trust)", hex::encode(&dev.user));
             println!("device id: {}{}", dev.device_id, if dev.master.is_some() { " (master)" } else { "" });
-            println!("user code: {}", encode_user_code(&dev.master_pub));
         }
-        Cmd::Name { user, name } => {
-            let uid = match decode_user_code(&user) {
-                Ok(k) => user_id_of(&k).to_vec(),
-                Err(_) => hex::decode(&user).context("expected a user code or hex user id")?,
-            };
-            session.db.set_name(&uid, &name)?;
-            println!("{} is now shown as {}", short(&uid), contact_label(&session, &uid)?);
-        }
-        Cmd::Verify { user_code, yes, name } => {
-            let dev = session.device()?;
-            let theirs = decode_user_code(&user_code)?;
-            let their_id = user_id_of(&theirs);
-            let sn = safety_number(&dev.user, &dev.master_pub, &their_id, &theirs)?;
-            println!("Safety number with user {}:\n\n{}\n", short(&their_id), format_safety_number(&sn.display));
-            println!("Or as words (the same order on both sides):");
-            for (mine, words) in sn.word_groups() {
-                println!("  {:<6} {}", if mine { "you:" } else { "them:" }, words.join(" "));
-            }
-            println!();
-            if let Ok(qr) = qrcode::QrCode::new(&sn.scannable) {
-                println!("{}", qr.render::<qrcode::render::unicode::Dense1x2>().quiet_zone(true).build());
-            }
-            println!("Compare it with theirs over a trusted channel (in person, a call).");
-            if !yes && !confirm("Do the numbers match?")? {
-                bail!("not verified");
-            }
-            session.db.pin(&their_id, &theirs, true)?;
-            if let Some(n) = &name {
-                session.db.set_name(&their_id, n)?;
-            }
-            println!("Pinned and verified.");
-            // Start post-quantum handshakes with their devices now, so the
-            // first messages between you aren't held up waiting for one.
-            for relay in session.db.relays()? {
-                let r = Engine::new(session.device()?, &format!("{}/{}", relay.trim_end_matches('/'), "0".repeat(32)))
-                    .and_then(|mut eng| rt.block_on(eng.pq_introduce(&their_id)));
-                if let Err(e) = r {
-                    eprintln!("note: could not start handshakes with their devices via {relay}: {} (they'll happen on first contact)", printable(&format!("{e:#}")));
-                }
-            }
-        }
+        Cmd::Contact(c) => contact_cmd(&session, &rt, c, account_relay.as_deref())?,
         Cmd::Register { relay_url, token } => register(&session, &rt, &relay_url, token)?,
         Cmd::Device(d) => device_cmd(&session, &rt, d, account_relay.as_deref())?,
         Cmd::Repo(RepoCmd::Init { relay_url, remote, allow_sha1 }) => {
@@ -365,13 +328,12 @@ fn run(cli: Cli) -> Result<()> {
             println!("Forgot {url} on this device. You are still a member: use `git e2ee repo leave` to leave.");
             println!("The git remote is unchanged; remove it with `git remote remove <name>` if you like.");
         }
-        Cmd::Member(MemberCmd::Add { user_code, remote }) => {
-            let key = decode_user_code(&user_code)?;
-            let uid = user_id_of(&key);
-            match session.db.pinned(&uid)? {
-                Some((k, true)) if k == key => {}
-                _ => bail!("verify this user first: git e2ee verify {user_code}"),
-            }
+        Cmd::Member(MemberCmd::Add { user, remote }) => {
+            let uid = resolve_user(&session, &user)?;
+            let key = match session.db.pinned(&uid)? {
+                Some((k, true)) => k,
+                _ => bail!("{user} isn't one of your contacts: add them first with `git e2ee contact add <name> <their user id>`"),
+            };
             let mut eng = remote.engine(&session)?;
             sync(&rt, &mut eng)?;
             if eng.require_state()?.roster.members.iter().any(|m| m.user_id == uid) {
@@ -398,10 +360,7 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Cmd::Member(MemberCmd::Remove { user, remote }) => {
-            let uid = match decode_user_code(&user) {
-                Ok(k) => user_id_of(&k).to_vec(),
-                Err(_) => hex::decode(&user).context("expected a user code or hex user id")?,
-            };
+            let uid = resolve_user(&session, &user)?;
             let mut eng = remote.engine(&session)?;
             sync(&rt, &mut eng)?;
             rt.block_on(eng.change_roster(None, Some(uid.clone())))?;
@@ -417,7 +376,7 @@ fn run(cli: Cli) -> Result<()> {
                 println!(
                     "{name}{}{me}  {}",
                     hex::encode(&m.user_id),
-                    if verified { "verified" } else { "unverified: added by another member" }
+                    if verified { "contact" } else { "not your contact: added by another member" }
                 );
                 let devices: Vec<String> = session.db.devices_of(&m.user_id)?.iter().map(|(d, _)| d.to_string()).collect();
                 let version = session.db.device_list_state(&m.user_id)?.map_or(0, |v| v.0);
@@ -480,7 +439,11 @@ fn run(cli: Cli) -> Result<()> {
                     "you".to_string()
                 } else {
                     let verified = session.db.pinned(&e.user_id)?.is_some_and(|p| p.1);
-                    format!("{} ({})", contact_label(&session, &e.user_id)?, if verified { "verified" } else { "unverified" })
+                    if verified {
+                        contact_label(&session, &e.user_id)?
+                    } else {
+                        format!("{} (not your contact)", contact_label(&session, &e.user_id)?)
+                    }
                 };
                 let when = fmt_time(e.at_ms);
                 // Entries this device didn't see itself are that member's word.
@@ -575,6 +538,106 @@ fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
+/// A user from a command line: a contact name or a hex user id.
+fn resolve_user(session: &Session, s: &str) -> Result<Vec<u8>> {
+    if let Some(u) = session.db.user_named(s)? {
+        return Ok(u);
+    }
+    parse_user_id(s).ok_or_else(|| anyhow!("no contact named {s:?}, and it isn't a user id: see `git e2ee contact list`"))
+}
+
+/// A user id: 64 hex characters.
+fn parse_user_id(s: &str) -> Option<Vec<u8>> {
+    hex::decode(s.trim()).ok().filter(|u| u.len() == 32)
+}
+
+/// `git e2ee contact ...`
+fn contact_cmd(session: &Session, rt: &tokio::runtime::Runtime, cmd: ContactCmd, relay: Option<&str>) -> Result<()> {
+    match cmd {
+        ContactCmd::Add { name, user_id } => {
+            let dev = session.device()?;
+            let uid = parse_user_id(&user_id)
+                .ok_or_else(|| anyhow!("{user_id:?} isn't a user id (64 hex characters; `git e2ee whoami` shows one)"))?;
+            if uid == dev.user {
+                bail!("that's your own user id");
+            }
+            let name = name.trim().to_string();
+            if name.is_empty() || name.chars().any(char::is_control) || name.chars().count() > 64 {
+                bail!("a contact name must be 1 to 64 printable characters");
+            }
+            if hex::decode(&name).is_ok_and(|b| b.len() == 32) {
+                bail!("a contact name can't look like a user id");
+            }
+            if let Some(other) = session.db.user_named(&name)?
+                && other != uid
+            {
+                bail!("you already have a contact named {name:?} (user {}): pick another name", short(&other));
+            }
+            let relay = match relay {
+                Some(r) => r.to_string(),
+                None => session.db.relays()?.into_iter().next().ok_or_else(|| anyhow!("this account isn't registered with its relay yet"))?,
+            };
+            // Their key comes from the relay; the user id (from a channel you
+            // trust) is its hash, so the relay can't substitute another.
+            let host = relay_host(&relay)?;
+            let bytes = rt.block_on(RelayClient::new(&relay)?.get_device_list(&hex::encode(&uid)))?.ok_or_else(|| {
+                anyhow!(
+                    "{host} has no account with user id {}: check the id, and that they created their account on \
+                     this relay (accounts are per relay; `git e2ee whoami` there shows the id)",
+                    hex::encode(&uid)
+                )
+            })?;
+            let signed = e2ee_proto::SignedDeviceList::decode(bytes.as_slice())?;
+            let body = e2ee_proto::DeviceListBody::decode(signed.body.as_slice())?;
+            if user_id_of(&body.master_key).as_slice() != uid {
+                bail!("{host} served a key that doesn't match this user id: refusing it (the relay may be misbehaving)");
+            }
+            e2ee_core::identity::verify_device_list(&signed, &body.master_key, None)
+                .context("their device list on the relay doesn't verify: refusing it")?;
+            session.db.pin(&uid, &body.master_key, true)?;
+            session.db.set_name(&uid, &name)?;
+            dev.accept_device_list(&uid, &signed)?;
+            println!("Added contact {name} (user {}).", short(&uid));
+            // Start post-quantum handshakes with their devices now, so the
+            // first messages between you aren't held up waiting for one.
+            let r = Engine::new(session.device()?, &format!("{}/{}", relay.trim_end_matches('/'), "0".repeat(32)))
+                .and_then(|mut eng| rt.block_on(eng.pq_introduce(&uid)));
+            if let Err(e) = r {
+                eprintln!("note: could not start handshakes with their devices: {} (they'll happen on first contact)", printable(&format!("{e:#}")));
+            }
+            println!("Once they've added you too, either of you can add the other to repos (`git e2ee member add {name}`).");
+        }
+        ContactCmd::List => {
+            let all = session.db.contacts()?;
+            if all.is_empty() {
+                println!("no contacts yet: add one with `git e2ee contact add <name> <user id>`");
+            }
+            for (u, n) in all {
+                println!("{:<20} {}", printable(&n), hex::encode(&u));
+            }
+        }
+        ContactCmd::Remove { contact } => {
+            let uid = resolve_user(session, &contact)?;
+            if !session.db.pinned(&uid)?.is_some_and(|p| p.1) {
+                bail!("{contact} isn't one of your contacts");
+            }
+            session.db.remove_contact(&uid)?;
+            // Not a member of any repo of ours either: forget their key, so
+            // they can't send us invitations any more.
+            let mut in_repo = false;
+            for url in known_repo_urls(session)? {
+                let eng = Engine::new(session.device()?, &url)?;
+                in_repo |= eng.state()?.is_some_and(|s| s.roster.members.iter().any(|m| m.user_id == uid));
+            }
+            if !in_repo {
+                session.db.unpin_unverified(&uid)?;
+            }
+            println!("Removed {} from your contacts. Repos they're in keep them; remove them there with `git e2ee member remove`.", short(&uid));
+        }
+    }
+    Ok(())
+}
+
 /// How to show a user: "you", the name you gave them, or a short id.
 fn contact_label(session: &Session, user: &[u8]) -> Result<String> {
     if session.device().is_ok_and(|d| d.user == user) {
@@ -651,7 +714,10 @@ fn init_user(rt: &tokio::runtime::Runtime, relay_url: &str, token: Option<String
     let session = Session::open_dir(&dir)?;
     let dev = Device::create_user(&session.db)?;
     println!("Created your account on {}: user {}", relay_host(relay_url)?, hex::encode(&dev.user));
-    println!("Your user code (share it with collaborators):\n  {}", encode_user_code(&dev.master_pub));
+    println!(
+        "Your user id (send it to collaborators over a channel you trust, e.g. a verified Signal chat):\n  {}",
+        hex::encode(&dev.user)
+    );
     if let Err(e) = register(&session, rt, relay_url, token) {
         bail!(
             "{e:#}\nThe account is created; register it when you can: `git e2ee register {relay_url}` \

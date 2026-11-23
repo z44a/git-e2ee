@@ -48,7 +48,8 @@ git clone e2ee::https://relay.example/3f9c…a1      # just git, after a one-tim
   Appends are compare-and-swap on the previous head, which also orders pushes. Every
   receiver checks that what a member told them matches what the log says.
 * **Cross-signing:** each user has a master key that signs a versioned list of their
-  device keys. Members pin each other's master keys after comparing **safety numbers**,
+  device keys. Members pin each other's master keys from the **user ids** (hashes of the
+master keys) they exchanged over a channel they trust,
   and libsignal is only allowed to open sessions with devices in a valid signed list.
   The relay can't add devices.
 * **No server-side history:** the relay is a mailbox. New members and new devices get
@@ -65,8 +66,8 @@ git clone e2ee::https://relay.example/3f9c…a1      # just git, after a one-tim
 | **Future quantum adversary** | Records traffic today, decrypts it later with a quantum computer. |
 | **Device thief / one-time compromise** | Copies a device's key material once (and possibly its disk). |
 
-The user's own devices, while uncompromised, and the people they verified safety numbers
-with are trusted.
+The user's own devices, while uncompromised, and the people they added as contacts (by
+a user id received over a channel they trust) are trusted.
 
 ## Cryptographic properties we uphold
 
@@ -229,10 +230,9 @@ with are trusted.
   libcrux). Device lists carry both signatures over the same domain-separated input,
   and verifiers (clients and the relay) require both.
 - The **master id** is the classical key followed by `H("git-e2ee/v1/pq-key",
-  ML-DSA key)`, 65 bytes. It is what peers pin and what user codes contain, and the
-  user id is its hash. The full ML-DSA key (2592 bytes) travels with each device list
-  and must hash to the pinned value. Safety numbers use libsignal's fingerprint over
-  the classical key with the user id as stable identifier, so they commit to both.
+  ML-DSA key)`, 65 bytes. It is what peers pin, and the user id is its hash, so a user
+  id commits to both keys. The full ML-DSA key (2592 bytes) travels with each device
+  list and must hash to the pinned value.
 - Each device also has an ML-DSA-87 key. Its hash is in the device entry (so link
   codes grow by 32 bytes) and the full key is uploaded at registration. The relay
   only accepts it if it matches the master-signed list, and requires both a
@@ -317,7 +317,7 @@ with are trusted.
   unauthenticated in the receiver's inbox. Messages that arrive under a handshake
   we started, before its response, are held and applied once it arrives. To keep
   this rare, handshakes start eagerly:
-  - on `git e2ee verify`, with the verified user's devices (this fetches their
+  - on `git e2ee contact add`, with the contact's devices (this fetches their
     device list from the relay, without saying who asks);
   - on `git e2ee init-user`, `device finish` and `register`, with our own other devices;
   - on every sync, with member devices we have no key with.
@@ -381,7 +381,7 @@ with are trusted.
   member switches the repo with a roster change that raises `Roster.protocol`, and
   from that log entry on everyone writes the new format. Roster changes can't lower
   it, so a member can't force a downgrade.
-- Codes carry their own version (`e2eeu1:`, `e2eed1:`, `e2eea2:`), and every
+- Codes carry their own version (`e2eed1:`, `e2eea2:`), and every
   domain-separation string contains `v1`. A new version that changes a hash or
   signature input gets new strings, so nothing signed under one version verifies
   under another.
@@ -464,7 +464,7 @@ with are trusted.
 
 **Device revocation without re-verification.**
 - The master key signs a new list without the lost device.
-- Safety numbers are computed over master keys, so they don't change.
+- User ids are hashes of master keys, so they don't change.
 
 **Device additions are never silent.**
 - Devices signed by a pinned master key are trusted automatically; that's the point of
@@ -1000,7 +1000,7 @@ ristretto255).
   write request.
 
 **Post-quantum authentication of the relay connection and of rate limits.**
-- Device lists, safety numbers, relay request signatures (ML-DSA-87) and messages
+- Device lists, user ids, relay request signatures (ML-DSA-87) and messages
   (ML-KEM handshake plus MACs) are post-quantum authenticated.
 - TLS certificates are classical: a quantum attacker could pose as the relay toward
   the network and learn what the relay sees anyway.
@@ -1135,68 +1135,39 @@ ristretto255).
 - The cross-signing, replication and relay code are unaudited.
 - libsignal is pinned to a tag commit but used in a way upstream doesn't support.
 
-## Safety numbers
+## Contacts and user ids
 
-`git e2ee verify` shows the safety number between two users in three encodings of the
-same fingerprints. Each person's fingerprint is libsignal's: 5200 iterations of SHA-512
-over their **master key** and user id, so it doesn't change when devices are added or
-revoked.
+A user's **user id** is the 256-bit hash of their master id (the classical key and
+the hash of the ML-DSA key), so it commits to both halves of the hybrid master key.
+People exchange user ids over a channel they already trust (a verified Signal chat,
+in person) and add each other with `git e2ee contact add <name> <user id>`, which:
 
-| Encoding | Per person | Total | Notes |
-|---|---|---|---|
-| QR code | 256 bits | 512 bits | Strongest; scan it when you are together. |
-| 60 digits (12 blocks of 5) | ≈ 99.7 bits | ≈ 199 bits | Signal's format: each 5-digit block is 40 hash bits mod 100 000. |
-| 20 BIP39 words (10 per person) | 110 bits | 220 bits | Easiest to read aloud. |
+- fetches the user's signed device list from the account's relay (anonymously; the
+  relay can't tell who asks);
+- accepts it only if the master key in it hashes to the user id, both signatures
+  verify, and the ML-DSA key matches the hash in the master id;
+- pins the master key as a *contact*, stores the name (local only, unique), adopts
+  the device list and starts the post-quantum handshakes with their devices.
 
-```
-Or as words (the same order on both sides):
-  them:  eyebrow only quality rose copy reopen ride mixture wolf able
-  you:   paddle service hybrid view option trick correct pledge upgrade mixture
-```
+**Why no safety numbers.**
+- The trust comes from the channel the id travelled over, not from a comparison:
+  the id is copied and pasted, so every bit is checked, and a 256-bit second
+  preimage is out of reach. Safety numbers exist for people who only have an
+  untrusted channel for the key itself and then compare a short digest by eye or
+  ear, where partial comparison is the real risk. Here nothing is compared by eye.
+- The relay can withhold a user's list (then `contact add` fails, saying so) but
+  can't substitute another key for an id.
+- What this relies on: that the channel really is the other person (their Signal
+  account and phone are theirs). That is the user's judgment, so the tool doesn't
+  ask about it.
 
-**Why 10 words.**
-- A BIP39 word carries 11 bits. Ten words (110 bits) is the smallest count that is at
-  least as strong as Signal's 30 digits per person (≈ 99.7 bits); nine words would be
-  99 bits.
-- An attacker who wants to pass verification has to find a key whose fingerprint
-  matches a specific value. That's a second-preimage search, with each guess costing
-  5200 SHA-512 iterations (about 2¹²), so it costs about 2¹²² hashes for 110 bits.
-- 8 words (88 bits) would still be out of reach, at about 2¹⁰⁰ hashes. We chose
-  parity with Signal over brevity.
-
-**How the words are made.**
-- The words are the first 110 bits of each person's 256-bit fingerprint, read as ten
-  11-bit indexes into the [BIP39 English list]. The list is checked against its
-  well-known SHA-256 in the tests.
-- The BIP39 *mnemonic algorithm* (checksum, seed derivation) is not used; the list is
-  only an alphabet.
-- The two groups are shown in a canonical order (smaller fingerprint first) and
-  labelled `you`/`them`, so both people read the same sequence.
-
-**Tradeoffs we accepted.**
-- *Errors in comparison affect usability, not security.*
-  - A misread, misheard, swapped or skipped word almost always just causes a false
-    mismatch, and people read again.
-  - For an error to turn an attacker's key into an apparent match, the attacker's
-    fingerprint would have to sit exactly one human mistake away from the real one.
-    Accepting every "one mistake away" variant costs only about 4–5 bits.
-  - So we don't use the PGP word list's even/odd scheme, which detects transpositions
-    and omissions, at 8 bits per word, about 13 words per person.
-  - BIP39 words are unique in their first four letters and avoid near-duplicates, but
-    they were chosen for writing down, not for being distinct when spoken. Read slowly
-    on calls, or use the QR code.
-- *The real risk is partial comparison.*
-  - If people check only the first few words, the attacker only has to match those:
-    4 words is 44 bits, which is feasible.
-  - Compare **all** words, both groups, or scan the QR code.
-  - The digits and the words come from the same fingerprints, so they are alternatives,
-    not independent checks; comparing both adds no security.
-- *Post-quantum.* Safety numbers commit to both halves of the hybrid master key
-  (Curve25519 and ML-DSA-87): the user id, a hash of the master id, is the
-  fingerprint's stable identifier. Matching numbers therefore also rule out a
-  substituted ML-DSA key.
-
-[BIP39 English list]: https://github.com/bitcoin/bips/blob/master/bip-0039/english.txt
+**Why both people add each other first.** Each pair of devices runs a post-quantum
+handshake (see the authentication section), and the device that starts one can only
+send data after the other answers. `contact add` starts the handshakes, so when Bob
+has added Alice before she adds him to a repo, her sync answers his handshake and
+sends the invitation in the same step, and his first `git clone` works. It is also
+the gate for invitations: mail from users who are neither contacts nor in a repo
+you're in is left unread on the relay.
 
 ## Install
 
@@ -1220,8 +1191,9 @@ git run `git-remote-e2ee`.
 
 You are a **user**, identified by a **master key** created on your first device
 (device 1, the *master device*). Every device has its own keys, and the master key signs
-the list of your devices. People trust each other by comparing **safety numbers** once;
-after that, devices you add are trusted automatically. A **repo** lives on a **relay**,
+the list of your devices. People trust each other by exchanging **user ids** once over
+a channel they trust and adding each other as contacts; after that, devices you add are
+trusted automatically. A **repo** lives on a **relay**,
 an untrusted server that stores only ciphertext. Its URL looks like
 `e2ee::https://relay.example/<repo id>/<name>`. Day-to-day work is plain `git push` / `pull`;
 `git-e2ee` is only needed for identity, devices and membership.
@@ -1297,14 +1269,14 @@ git e2ee init-user https://relay.example --token <token>   # invite-only relays
 This creates your master key, makes this device 1, and registers it: it uploads your
 signed device list and prekeys (including post-quantum Kyber prekeys). After this,
 prekeys are rotated and topped up automatically whenever you use the relay. It prints
-your **user code** (`e2eeu1:…`), which is safe to share: it's your public master key.
+your **user id**, which is safe to share: it's the hash of your public master key.
 `git e2ee whoami` prints it again.
 
 **An account belongs to one relay.** On another relay, `init-user` creates another
-account: a separate user with its own master key, user code, devices and contacts.
+account: a separate user with its own master key, user id, devices and contacts.
 Accounts share nothing, so relays (or anyone who seizes several) can't link them, and
 "who am I here" is always the relay's account. A person on two relays is two users,
-and collaborators verify each one separately. The account is picked by the relay:
+and collaborators add each one separately. The account is picked by the relay:
 a repo's remote URL for repo commands and git, otherwise `--relay <url>`, the current
 repo's relay, or your only account. `git e2ee accounts` lists them. The account key
 is the relay's host name (without port), so the same relay reached directly or
@@ -1316,26 +1288,25 @@ overridden with `GIT_E2EE_HOME`). An identity created before accounts were per r
 The state contains your private keys: don't sync it to cloud storage or back it up
 casually (see "What we do not uphold").
 
-### 3. Verify the people you work with
+### 3. Add the people you work with as contacts
 
-Before you share a repo, both of you verify each other, **in both directions**:
+Send each other your user ids over a channel you trust (a verified Signal chat, in
+person), then each add the other, **in both directions**:
 
 ```sh
-alice$ git e2ee verify e2eeu1:<bob's code>
-bob$   git e2ee verify e2eeu1:<alice's code>
+alice$ git e2ee contact add Bob <bob's user id>
+bob$   git e2ee contact add Alice <alice's user id>
 ```
 
-`verify` shows the safety number for the pair: 60 digits, 10 words per person and a QR
-code. Compare them over a channel an attacker can't tamper with (in person, or a voice
-call where you recognize each other). Read *all* the words, and answer `y` only if they
-match. This pins the other person's master key.
+This fetches their key from the relay, checks it hashes to the id, and pins it under
+that name (local only; adding again renames). Nothing is compared: the channel you got
+the id over is what vouches for them. `contact list` and `contact remove` manage them.
 
-* Exchanging user codes over a chat app is fine. The comparison step is what protects
-  you.
-* Both directions matter. Alice must have pinned Bob to add him, and Bob must have
-  pinned Alice to accept what she sends. Mail from users you haven't pinned (or who
-  aren't in a repo you're in) is left unread.
-* `--yes` skips the prompt. Only use it if you compared out of band.
+* Both directions matter. Alice must have added Bob to add him to a repo, and Bob
+  must have added Alice to accept what she sends. Mail from users who aren't your
+  contacts (or in a repo you're in) is left unread.
+* Add each other *before* the repo invite, so the first `git clone` works at once
+  (see "Contacts and user ids").
 
 ### 4. Create a repo
 
@@ -1363,11 +1334,11 @@ Use `--remote <name>` for another remote name.
 
 ### 5. Add members
 
-Prerequisites: the newcomer has registered with the relay (step 2), and you've
-verified each other (step 3). Then, inside the repo:
+Prerequisites: the newcomer has an account on the relay (step 2), and you've added
+each other as contacts (step 3). Then, inside the repo:
 
 ```sh
-alice$ git e2ee member add e2eeu1:<bob's code>
+alice$ git e2ee member add Bob
 ```
 
 This records the membership change in the relay log and sends Bob's devices a
@@ -1379,9 +1350,9 @@ bob$ git clone e2ee::https://relay.example/<id>/project
 ```
 
 Other members' devices learn about Bob on their next fetch. They trust him because a
-member they trust added him: `git e2ee member list` shows each member as *verified* (you
-compared safety numbers) or *unverified* (added by someone else). Run `git e2ee verify`
-to upgrade.
+member they trust added him: `git e2ee member list` shows each member as your *contact*
+or *not your contact* (added by someone else). Add them with `git e2ee contact add` to
+use a name for them.
 
 ### 6. Everyday work
 
@@ -1480,7 +1451,7 @@ fails and says to approve again) but can't substitute one.
 Only the master device (device 1) can approve or revoke devices. `send-history` sends
 the repo state to all your other devices now; use `--device <id>` to target one.
 Collaborators start encrypting to the new device automatically. Its key is in a list
-signed by your master key, so they don't re-verify, and your safety number doesn't
+signed by your master key, so they don't need to do anything, and your user id doesn't
 change.
 
 ### 8. Lose or retire a device
@@ -1500,13 +1471,13 @@ the device already had stays on it. If it was stolen, treat that data as exposed
 **If you lose the master device**, you can't approve or revoke devices any more. Your
 other devices keep working, but there's no recovery of the master key (by design, it
 exists only on device 1). To regain control, create a new user with
-`git e2ee init-user <relay>` on a fresh device. Have your collaborators verify the new
-identity, add it, and remove the old one.
+`git e2ee init-user <relay>` on a fresh device. Send your collaborators the new user id;
+they add it as a contact, add it to repos, and remove the old one.
 
 ### 9. Remove a member
 
 ```sh
-git e2ee member remove e2eeu1:<code>        # or the hex user id from `member list`
+git e2ee member remove Bob        # or the hex user id from `member list`
 ```
 
 This records the removal in the log, gives the remaining members a new repo secret,

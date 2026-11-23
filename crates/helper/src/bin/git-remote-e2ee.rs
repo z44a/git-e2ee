@@ -81,9 +81,9 @@ fn run() -> Result<()> {
                     bail!(
                         "this device has no history for this repo yet.\n\
                          If you were invited, the invitation may not have arrived yet, or may have expired:\n\
-                         ask the member who invited you to run `git e2ee member add <your user code>` again\n\
-                         (it re-sends the invitation), then run `git clone` again. They must have verified you, and\n\
-                         you must have verified them (`git e2ee verify`) and registered with this relay.\n\
+                         ask the member who invited you to run `git e2ee member add <your name>` again\n\
+                         (it re-sends the invitation), then run `git clone` again. You must have added them as a\n\
+                         contact (`git e2ee contact add <name> <their user id>`), as they did you.\n\
                          For your own device: your device that has the repo sends it on its next fetch, push or\n\
                          `git e2ee sync` (run one there), then clone again."
                     );

@@ -55,6 +55,11 @@ impl TestRelay {
     }
 }
 
+/// The contact name tests give a user: from its id, so it's unique.
+fn nick(user_id: &str) -> String {
+    format!("u-{}", &user_id[..12])
+}
+
 /// The hex repo id in a remote URL (which ends with the repo's name).
 fn rid_of(url: &str) -> String {
     hex::encode(e2ee_core::engine::parse_url(url).unwrap().1)
@@ -123,9 +128,10 @@ impl Dev {
         self.ok("git", cwd, args)
     }
 
+    /// Create the account; returns its user id (what people share).
     fn init_user(&self, relay: &str) -> String {
-        let out = self.e2ee(&self.root, &["init-user", relay]);
-        code_from(&out, "e2eeu1:")
+        self.e2ee(&self.root, &["init-user", relay]);
+        self.user_hex()
     }
 
     /// This device's account state on the test relay (accounts are per
@@ -147,7 +153,7 @@ impl Dev {
 
     fn user_hex(&self) -> String {
         let out = self.e2ee(&self.root, &["whoami"]);
-        out.lines().find_map(|l| l.strip_prefix("user id:")).unwrap().trim().to_string()
+        out.lines().find_map(|l| l.strip_prefix("user id:")).unwrap().split_whitespace().next().unwrap().to_string()
     }
 
     fn status(&self, repo: &Path) -> String {
@@ -212,8 +218,8 @@ fn world_with(limits: e2ee_relay::Limits) -> World {
     alice.git(&arepo, &["push", "-q", "-u", "origin", "main"]);
     let url = alice.git(&arepo, &["config", "remote.origin.url"]).trim().to_string();
 
-    alice.e2ee(&root, &["verify", &bob_code, "--yes"]);
-    bob.e2ee(&root, &["verify", &alice_code, "--yes"]);
+    alice.e2ee(&root, &["contact", "add", &nick(&bob_code), &bob_code]);
+    bob.e2ee(&root, &["contact", "add", &nick(&alice_code), &alice_code]);
     alice.e2ee(&arepo, &["member", "add", &bob_code]);
 
     let brepo = root.join("brepo");
@@ -540,34 +546,45 @@ fn hidden_recipient_in_roster_change_is_detected() {
     let w = world();
     let carol = Dev::new(&w.root, "carol");
     let carol_code = carol.init_user(&w.relay.url);
-    w.alice.e2ee(&w.root, &["verify", &carol_code, "--yes"]);
+    w.alice.e2ee(&w.root, &["contact", "add", &nick(&carol_code), &carol_code]);
     w.alice.with_env("E2EE_TEST_BAD_RECIPIENTS", "1").e2ee(&w.arepo, &["member", "add", &carol_code]);
     let out = w.bob.run("git", &w.brepo, &["fetch", "-q"]);
     assert!(!out.status.success());
     assert!(stderr(&out).contains("recipient device set"), "{}", stderr(&out));
 }
 
+/// Contacts: added by the user id (the relay's key must hash to it), named
+/// uniquely, required before `member add`, usable by name, removable.
 #[test]
-fn interactive_verify_requires_confirmation() {
+fn contacts_are_added_by_user_id_and_used_by_name() {
     let w = world();
     let carol = Dev::new(&w.root, "carol");
-    let carol_code = carol.init_user(&w.relay.url);
-    let answer = |a: &str| {
-        let mut c = w.alice.cmd("git-e2ee", &w.root);
-        c.args(["verify", &carol_code]).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
-        let mut child = c.spawn().unwrap();
-        use std::io::Write;
-        child.stdin.take().unwrap().write_all(a.as_bytes()).unwrap();
-        child.wait_with_output().unwrap()
-    };
-    let no = answer("n\n");
-    assert!(!no.status.success());
-    assert!(String::from_utf8_lossy(&no.stdout).contains("you:"), "words shown");
-    // Not pinned, so adding Carol is refused.
-    let add = w.alice.run("git-e2ee", &w.arepo, &["member", "add", &carol_code]);
-    assert!(stderr(&add).contains("verify this user first"), "{}", stderr(&add));
-    assert!(answer("y\n").status.success());
-    w.alice.e2ee(&w.arepo, &["member", "add", &carol_code]);
+    let carol_id = carol.init_user(&w.relay.url);
+    // Not a contact yet: refused.
+    let add = w.alice.run("git-e2ee", &w.arepo, &["member", "add", &carol_id]);
+    assert!(!add.status.success() && stderr(&add).contains("contact add"), "{}", stderr(&add));
+    // An id with no account on this relay.
+    let bogus = "ab".repeat(32);
+    let out = w.alice.run("git-e2ee", &w.root, &["contact", "add", "Nobody", &bogus]);
+    assert!(!out.status.success() && stderr(&out).contains("has no account"), "{}", stderr(&out));
+    // Names are unique.
+    let taken = w.alice.run("git-e2ee", &w.root, &["contact", "add", &nick(&w.bob.user_hex()), &carol_id]);
+    assert!(!taken.status.success() && stderr(&taken).contains("already have a contact named"), "{}", stderr(&taken));
+
+    w.alice.e2ee(&w.root, &["contact", "add", "Carol", &carol_id]);
+    carol.e2ee(&w.root, &["contact", "add", "Alice", &w.alice.user_hex()]);
+    assert!(w.alice.e2ee(&w.root, &["contact", "list"]).contains(&format!("Carol                {carol_id}")));
+    w.alice.e2ee(&w.arepo, &["member", "add", "Carol"]);
+    let crepo = w.root.join("crepo");
+    carol.git(&w.root, &["clone", "-q", &w.url, crepo.to_str().unwrap()]);
+    assert!(crepo.join("plans.txt").exists());
+    w.alice.e2ee(&w.arepo, &["member", "remove", "Carol"]);
+
+    // Removed contacts are gone from the list, and can't be added by name.
+    w.alice.e2ee(&w.root, &["contact", "remove", "Carol"]);
+    assert!(!w.alice.e2ee(&w.root, &["contact", "list"]).contains("Carol"));
+    let add = w.alice.run("git-e2ee", &w.arepo, &["member", "add", "Carol"]);
+    assert!(!add.status.success(), "{}", stderr(&add));
 }
 
 #[test]
@@ -598,8 +615,8 @@ fn prekey_rotation_does_not_break_sessions() {
     let bob = w.bob.with_env("E2EE_PREKEY_ROTATE_SECS", "0");
     let carol = Dev::new(&w.root, "carol");
     let carol_code = carol.init_user(&w.relay.url);
-    let alice_code = code_from(&w.alice.e2ee(&w.root, &["whoami"]), "e2eeu1:");
-    carol.e2ee(&w.root, &["verify", &alice_code, "--yes"]);
+    let alice_code = w.alice.user_hex();
+    carol.e2ee(&w.root, &["contact", "add", &nick(&alice_code), &alice_code]);
     for i in 0..3 {
         let c = commit(&w.alice, &w.arepo, &format!("p{i}"), "p\n", "rot");
         w.alice.git(&w.arepo, &["push", "-q"]);
@@ -607,7 +624,7 @@ fn prekey_rotation_does_not_break_sessions() {
         assert_eq!(bob.git(&w.brepo, &["rev-parse", "HEAD"]).trim(), c);
     }
     // A brand-new session with Bob uses his rotated prekeys.
-    w.alice.e2ee(&w.root, &["verify", &carol_code, "--yes"]);
+    w.alice.e2ee(&w.root, &["contact", "add", &nick(&carol_code), &carol_code]);
     w.alice.e2ee(&w.arepo, &["member", "add", &carol_code]);
     let crepo = w.root.join("crepo");
     carol.git(&w.root, &["clone", "-q", &w.url, crepo.to_str().unwrap()]);
@@ -626,9 +643,9 @@ fn messages_to_a_deleted_prekey_recover_via_resend() {
     let w = world();
     let carol = Dev::new(&w.root, "carol");
     let carol_code = carol.init_user(&w.relay.url);
-    let alice_code = code_from(&w.alice.e2ee(&w.root, &["whoami"]), "e2eeu1:");
-    carol.e2ee(&w.root, &["verify", &alice_code, "--yes"]);
-    w.alice.e2ee(&w.root, &["verify", &carol_code, "--yes"]);
+    let alice_code = w.alice.user_hex();
+    carol.e2ee(&w.root, &["contact", "add", &nick(&alice_code), &alice_code]);
+    w.alice.e2ee(&w.root, &["contact", "add", &nick(&carol_code), &carol_code]);
     w.alice.e2ee(&w.arepo, &["member", "add", &carol_code]);
     let crepo = w.root.join("crepo");
     carol.git(&w.root, &["clone", "-q", &w.url, crepo.to_str().unwrap()]);
@@ -871,9 +888,9 @@ fn newcomer_gets_device_lists_from_the_history_bundle() {
 
     let carol = Dev::new(&w.root, "carol");
     let carol_code = carol.init_user(&w.relay.url);
-    let alice_code = code_from(&w.alice.e2ee(&w.root, &["whoami"]), "e2eeu1:");
-    carol.e2ee(&w.root, &["verify", &alice_code, "--yes"]);
-    w.alice.e2ee(&w.root, &["verify", &carol_code, "--yes"]);
+    let alice_code = w.alice.user_hex();
+    carol.e2ee(&w.root, &["contact", "add", &nick(&alice_code), &alice_code]);
+    w.alice.e2ee(&w.root, &["contact", "add", &nick(&carol_code), &carol_code]);
     w.alice.e2ee(&w.arepo, &["member", "add", &carol_code]);
     let crepo = w.root.join("crepo");
     carol.git(&w.root, &["clone", "-q", &w.url, crepo.to_str().unwrap()]);
@@ -1012,8 +1029,8 @@ fn bad_history_bundle_is_discarded_not_blocking() {
     let (alice, bob) = (Dev::new(&root, "alice"), Dev::new(&root, "bob"));
     let alice_code = alice.init_user(&relay.url);
     let bob_code = bob.init_user(&relay.url);
-    alice.e2ee(&root, &["verify", &bob_code, "--yes"]);
-    bob.e2ee(&root, &["verify", &alice_code, "--yes"]);
+    alice.e2ee(&root, &["contact", "add", &nick(&bob_code), &bob_code]);
+    bob.e2ee(&root, &["contact", "add", &nick(&alice_code), &alice_code]);
     let arepo = root.join("a");
     alice.git(&root, &["init", "-q", "--object-format=sha256", "-b", "main", arepo.to_str().unwrap()]);
     commit(&alice, &arepo, "f", "f\n", "f");
@@ -1047,7 +1064,7 @@ fn unreachable_device_is_backed_off_reported_and_expired() {
     let link = code_from(&laptop.e2ee(&w.root, &["device", "link", &w.relay.url]), "e2eed1:");
     let approval = code_from(&w.bob.e2ee(&w.root, &["device", "approve", &link]), "e2eea2:");
     let out = laptop.e2ee(&w.root, &["device", "finish", &approval]);
-    let bob_hex = w.bob.e2ee(&w.root, &["whoami"]).lines().find_map(|l| l.strip_prefix("user id:").map(|x| x.trim().to_string())).unwrap();
+    let bob_hex = w.bob.user_hex();
     assert!(out.contains("Linked as device 2"), "{out}");
     w.relay.relay.drop_device_keys(&bob_hex, 2);
     w.bob.with_env("E2EE_GOSSIP_SECS", "0").e2ee(&w.brepo, &["sync"]); // tells Alice about the laptop (in-band)
@@ -1143,9 +1160,9 @@ fn packs_are_chunked_and_streamed() {
     // A new member's history bundle is chunked the same way.
     let carol = Dev::new(&w.root, "carol");
     let carol_code = carol.init_user(&w.relay.url);
-    let alice_code = code_from(&w.alice.e2ee(&w.root, &["whoami"]), "e2eeu1:");
-    carol.e2ee(&w.root, &["verify", &alice_code, "--yes"]);
-    w.alice.e2ee(&w.root, &["verify", &carol_code, "--yes"]);
+    let alice_code = w.alice.user_hex();
+    carol.e2ee(&w.root, &["contact", "add", &nick(&alice_code), &alice_code]);
+    w.alice.e2ee(&w.root, &["contact", "add", &nick(&carol_code), &carol_code]);
     alice.e2ee(&w.arepo, &["member", "add", &carol_code]);
     let crepo = w.root.join("crepo");
     carol.git(&w.root, &["clone", "-q", &w.url, crepo.to_str().unwrap()]);
@@ -1228,7 +1245,8 @@ fn push_log_records_who_changed_what() {
     let bob_short = &w.bob.user_hex()[..12];
     let alice_short = &w.alice.user_hex()[..12];
     // Alice's view: Bob created feature and moved main; she deleted it.
-    assert!(alog.contains(&format!("{bob_short} (verified) dev 1")), "{alog}");
+    // (Alice's contact name for Bob contains his short id.)
+    assert!(alog.contains(&format!("{bob_short} dev 1")), "{alog}");
     assert!(alog.contains("refs/heads/feature  created"), "{alog}");
     assert!(alog.contains("refs/heads/main  ") && alog.contains(" -> "), "{alog}");
     assert!(alog.contains("refs/heads/feature  deleted"), "{alog}");
@@ -1240,8 +1258,9 @@ fn push_log_records_who_changed_what() {
         let seq = line.split_whitespace().next().unwrap();
         let bob_line = blog.lines().find(|l| l.split_whitespace().next() == Some(seq)).unwrap_or("");
         let pusher = |l: &str| l.split_whitespace().nth(3).map(str::to_string);
-        let a = pusher(line).map(|p| if p == "you" { alice_short.to_string() } else { p });
-        let b = pusher(bob_line).map(|p| if p == "you" { bob_short.to_string() } else { p });
+        // (Contact names in tests are "u-" and the short id.)
+        let a = pusher(line).map(|p| if p == "you" { alice_short.to_string() } else { p.trim_start_matches("u-").to_string() });
+        let b = pusher(bob_line).map(|p| if p == "you" { bob_short.to_string() } else { p.trim_start_matches("u-").to_string() });
         if !bob_line.contains("[according to ") {
             assert_eq!(a, b, "members disagree on who made entry {seq}:\n{alog}\n{blog}");
         }
@@ -1359,13 +1378,13 @@ fn relay_database_stores_no_timestamps() {
 fn tagged_carol(w: &World) -> (Dev, String) {
     let carol = Dev::new(&w.root, "carol");
     let carol_code = carol.init_user(&w.relay.url);
-    let alice_code = code_from(&w.alice.e2ee(&w.root, &["whoami"]), "e2eeu1:");
+    let alice_code = w.alice.user_hex();
     w.relay.relay.tag_tokens(Some(&carol.user_hex()), true);
     // Her own periodic re-check is off: only comparing with members can tell.
     let carol = carol.with_env("E2EE_TOKEN_GEN_CHECK_SECS", "999999");
-    carol.e2ee(&w.root, &["verify", &alice_code, "--yes"]); // her first tokens: tagged
+    carol.e2ee(&w.root, &["contact", "add", &nick(&alice_code), &alice_code]); // her first tokens: tagged
     w.relay.relay.tag_tokens(Some(&carol.user_hex()), false); // everyone else: the real key
-    w.alice.e2ee(&w.root, &["verify", &carol_code, "--yes"]);
+    w.alice.e2ee(&w.root, &["contact", "add", &nick(&carol_code), &carol_code]);
     (carol, carol_code)
 }
 
@@ -1385,7 +1404,7 @@ fn tagged_member_notices_its_token_key_differs_from_members() {
 fn members_notice_a_member_given_its_own_token_key() {
     let w = world();
     let (carol, _) = tagged_carol(&w);
-    let alice_code = code_from(&w.alice.e2ee(&w.root, &["whoami"]), "e2eeu1:");
+    let alice_code = w.alice.user_hex();
     let crepo = w.root.join("carol-own");
     carol.git(&w.root, &["init", "-q", "--object-format=sha256", crepo.to_str().unwrap()]);
     commit(&carol, &crepo, "c.txt", "c\n", "c");
@@ -1426,9 +1445,9 @@ fn a_member_cannot_take_credit_for_someone_elses_push() {
     let w = world();
     let carol = Dev::new(&w.root, "carol");
     let carol_code = carol.init_user(&w.relay.url);
-    let alice_code = code_from(&w.alice.e2ee(&w.root, &["whoami"]), "e2eeu1:");
-    carol.e2ee(&w.root, &["verify", &alice_code, "--yes"]);
-    w.alice.e2ee(&w.root, &["verify", &carol_code, "--yes"]);
+    let alice_code = w.alice.user_hex();
+    carol.e2ee(&w.root, &["contact", "add", &nick(&alice_code), &alice_code]);
+    w.alice.e2ee(&w.root, &["contact", "add", &nick(&carol_code), &carol_code]);
     w.alice.e2ee(&w.arepo, &["member", "add", &carol_code]);
     let crepo = w.root.join("crepo");
     carol.git(&w.root, &["clone", "-q", &w.url, crepo.to_str().unwrap()]);
@@ -1625,9 +1644,9 @@ fn each_relay_has_its_own_account() {
     // Another host name for the second relay (the account key is the host).
     let other = start_relay_named(Default::default(), Some("localhost"));
     let other_url = other.url.clone();
+    let code1 = w.alice.user_hex();
     let out = w.alice.e2ee(&w.root, &["init-user", &other_url]);
-    let code2 = code_from(&out, "e2eeu1:");
-    let code1 = code_from(&w.alice.e2ee(&w.arepo, &["whoami"]), "e2eeu1:");
+    let code2 = out.lines().skip_while(|l| !l.contains("Your user id")).nth(1).unwrap().trim().to_string();
     assert_ne!(code1, code2, "a new relay gets a new user");
     // Again on the same relay: refused, there's one account per relay.
     let again = w.alice.run("git-e2ee", &w.root, &["init-user", &other_url]);
@@ -1717,9 +1736,9 @@ fn clone_names_the_directory_after_the_repo() {
     assert!(w.url.ends_with("/arepo"), "{}", w.url);
     let dana = Dev::new(&w.root, "dana");
     let dana_code = dana.init_user(&w.relay.url);
-    let alice_code = code_from(&w.alice.e2ee(&w.arepo, &["whoami"]), "e2eeu1:");
-    w.alice.e2ee(&w.root, &["verify", &dana_code, "--yes"]);
-    dana.e2ee(&w.root, &["verify", &alice_code, "--yes"]);
+    let alice_code = w.alice.user_hex();
+    w.alice.e2ee(&w.root, &["contact", "add", &nick(&dana_code), &dana_code]);
+    dana.e2ee(&w.root, &["contact", "add", &nick(&alice_code), &alice_code]);
     let out = w.alice.e2ee(&w.arepo, &["member", "add", &dana_code]);
     assert!(out.contains(&format!("git clone {}", w.url)), "{out}");
     let dir = w.root.join("dana-clones");
@@ -1802,9 +1821,9 @@ fn catch_up_refuses_a_bundle_off_our_chain() {
 fn add_carol(w: &World) -> (Dev, PathBuf) {
     let carol = Dev::new(&w.root, "carol");
     let carol_code = carol.init_user(&w.relay.url);
-    let alice_code = code_from(&w.alice.e2ee(&w.root, &["whoami"]), "e2eeu1:");
-    carol.e2ee(&w.root, &["verify", &alice_code, "--yes"]);
-    w.alice.e2ee(&w.root, &["verify", &carol_code, "--yes"]);
+    let alice_code = w.alice.user_hex();
+    carol.e2ee(&w.root, &["contact", "add", &nick(&alice_code), &alice_code]);
+    w.alice.e2ee(&w.root, &["contact", "add", &nick(&carol_code), &carol_code]);
     w.alice.e2ee(&w.arepo, &["member", "add", &carol_code]);
     let crepo = w.root.join("crepo");
     carol.git(&w.root, &["clone", "-q", &w.url, crepo.to_str().unwrap()]);
@@ -1922,15 +1941,16 @@ fn log_names_contacts_and_where_inherited_entries_came_from() {
     let w = world();
     let alice_short = &w.alice.user_hex()[..12];
     let log = w.bob.e2ee(&w.brepo, &["log"]);
-    assert!(log.contains(&format!("[according to {alice_short}]")), "{log}");
-    let alice_code = code_from(&w.alice.e2ee(&w.root, &["whoami"]), "e2eeu1:");
-    w.bob.e2ee(&w.root, &["name", &alice_code, "Alice"]);
+    assert!(log.contains(&format!("[according to {}]", nick(&w.alice.user_hex()))), "{log}");
+    let alice_code = w.alice.user_hex();
+    // Adding a contact again renames it.
+    w.bob.e2ee(&w.root, &["contact", "add", "Alice", &alice_code]);
     commit(&w.alice, &w.arepo, "n.txt", "n\n", "named");
     w.alice.git(&w.arepo, &["push", "-q"]);
     w.bob.git(&w.brepo, &["pull", "-q", "--ff-only"]);
     let log = w.bob.e2ee(&w.brepo, &["log"]);
     assert!(log.contains("[according to Alice]"), "{log}");
-    assert!(log.contains("Alice (verified)"), "{log}");
+    assert!(log.contains("Alice dev"), "{log}");
     assert!(!log.contains(alice_short), "{log}");
     assert!(w.bob.e2ee(&w.brepo, &["member", "list"]).contains("Alice  "));
 }
@@ -1981,9 +2001,9 @@ fn bundles_with_refs_not_matching_their_view_are_refused() {
     w.alice.git(&w.arepo, &["push", "-q"]);
     let carol = Dev::new(&w.root, "carol");
     let carol_code = carol.init_user(&w.relay.url);
-    let alice_code = code_from(&w.alice.e2ee(&w.root, &["whoami"]), "e2eeu1:");
-    carol.e2ee(&w.root, &["verify", &alice_code, "--yes"]);
-    w.alice.e2ee(&w.root, &["verify", &carol_code, "--yes"]);
+    let alice_code = w.alice.user_hex();
+    carol.e2ee(&w.root, &["contact", "add", &nick(&alice_code), &alice_code]);
+    w.alice.e2ee(&w.root, &["contact", "add", &nick(&carol_code), &carol_code]);
     w.alice.with_env("E2EE_TEST_FORGE_BUNDLE_REFS", &first).e2ee(&w.arepo, &["member", "add", &carol_code]);
     let crepo = w.root.join("crepo");
     let out = carol.run("git", &w.root, &["clone", "-q", &w.url, crepo.to_str().unwrap()]);
@@ -1999,14 +2019,14 @@ fn fake_upgrades_are_conflicts_and_new_members_are_announced() {
     let w = world();
     let carol = Dev::new(&w.root, "carol");
     let carol_code = carol.init_user(&w.relay.url);
-    w.alice.e2ee(&w.root, &["verify", &carol_code, "--yes"]);
+    w.alice.e2ee(&w.root, &["contact", "add", &nick(&carol_code), &carol_code]);
     w.alice.e2ee(&w.arepo, &["member", "add", &carol_code]);
     let out = w.bob.e2ee(&w.brepo, &["sync"]);
-    assert!(out.contains(&format!("added user {}", &carol.user_hex()[..12])) && out.contains("haven't verified"), "{out}");
+    assert!(out.contains(&format!("added user {}", &carol.user_hex()[..12])) && out.contains("aren't one of your contacts"), "{out}");
 
     let dana = Dev::new(&w.root, "dana");
     let dana_code = dana.init_user(&w.relay.url);
-    w.alice.e2ee(&w.root, &["verify", &dana_code, "--yes"]);
+    w.alice.e2ee(&w.root, &["contact", "add", &nick(&dana_code), &dana_code]);
     // Alice's own client already refuses what it just appended.
     let out = w
         .alice
@@ -2217,9 +2237,9 @@ fn log_entries_disappear_on_the_timer_they_were_recorded_under() {
 fn invite_and_let_it_expire(w: &World) -> (Dev, String) {
     let carol = Dev::new(&w.root, "carol");
     let carol_code = carol.init_user(&w.relay.url);
-    let alice_code = code_from(&w.alice.e2ee(&w.root, &["whoami"]), "e2eeu1:");
-    carol.e2ee(&w.root, &["verify", &alice_code, "--yes"]);
-    w.alice.e2ee(&w.root, &["verify", &carol_code, "--yes"]);
+    let alice_code = w.alice.user_hex();
+    carol.e2ee(&w.root, &["contact", "add", &nick(&alice_code), &alice_code]);
+    w.alice.e2ee(&w.root, &["contact", "add", &nick(&carol_code), &carol_code]);
     let out = w.alice.e2ee(&w.arepo, &["member", "add", &carol_code]);
     assert!(out.contains("re-sends it about weekly"), "{out}");
     for _ in 0..2 {
@@ -2228,7 +2248,7 @@ fn invite_and_let_it_expire(w: &World) -> (Dev, String) {
     }
     let crepo = w.root.join("crepo");
     let out = carol.run("git", &w.root, &["clone", "-q", &w.url, crepo.to_str().unwrap()]);
-    assert!(!out.status.success() && stderr(&out).contains("`git e2ee member add <your user code>` again"), "{}", stderr(&out));
+    assert!(!out.status.success() && stderr(&out).contains("`git e2ee member add <your name>` again"), "{}", stderr(&out));
     assert!(w.alice.status(&w.arepo).contains("hasn't cloned yet"), "{}", w.alice.status(&w.arepo));
     (carol, carol_code)
 }

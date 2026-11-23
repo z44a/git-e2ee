@@ -1,6 +1,6 @@
 //! Cross-signing: a per-user master key signs a versioned list of device
-//! identity keys. Peers pin the master key (after comparing safety numbers)
-//! and only open sessions with devices in a list it signed.
+//! identity keys. Peers pin the master key (its hash is the user id they
+//! exchanged) and only open sessions with devices in a list it signed.
 //!
 //! The master key is hybrid: a Curve25519 key and an ML-DSA-87 key, and
 //! device lists carry both signatures. Forging a list needs both broken, so a
@@ -10,10 +10,10 @@ use anyhow::{Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use e2ee_proto::{
-    DeviceEntry, DeviceListBody, Hash, MASTER_ID_LEN, Message, SignedDeviceList, ZERO_HASH, domain, master_id, pq,
+    DeviceEntry, DeviceListBody, Hash, Message, SignedDeviceList, ZERO_HASH, domain, master_id, pq,
     sha256, signing_input, split_master_id, user_id_of,
 };
-use libsignal_protocol::{Fingerprint, IdentityKey, IdentityKeyPair};
+use libsignal_protocol::{IdentityKey, IdentityKeyPair};
 
 /// A user's hybrid master key pair (only on the master device).
 #[derive(Clone)]
@@ -188,142 +188,11 @@ pub fn next_device_list(
     }
 }
 
-/// Safety number between two users, computed over their master keys. The
-/// libsignal fingerprint takes the classical key, and the user id (its
-/// "stable identifier") is a hash of the whole master id, so the number also
-/// commits to the ML-DSA key.
-pub struct SafetyNumber {
-    /// 60 digits: about 99.7 bits per person, as in Signal.
-    pub display: String,
-    /// Protobuf with 256 bits per person, for the QR code.
-    pub scannable: Vec<u8>,
-    /// `WORDS_PER_PERSON` BIP39 words per person (110 bits each).
-    pub local_words: Vec<&'static str>,
-    pub remote_words: Vec<&'static str>,
-}
-
-/// 10 words x 11 bits = 110 bits per person, at least the ~99.7 bits of
-/// Signal's 30 digits per person.
-pub const WORDS_PER_PERSON: usize = 10;
-
-static BIP39_ENGLISH: &str = include_str!("bip39_english.txt");
-
-fn bip39_words() -> Vec<&'static str> {
-    BIP39_ENGLISH.lines().collect()
-}
-
-/// Encode the leading `WORDS_PER_PERSON * 11` bits of a fingerprint as words,
-/// using the BIP39 list as a plain base-2048 alphabet (no BIP39 checksum).
-pub fn fingerprint_words(fp: &[u8]) -> Vec<&'static str> {
-    let list = bip39_words();
-    (0..WORDS_PER_PERSON)
-        .map(|i| {
-            let mut idx = 0usize;
-            for bit in i * 11..(i + 1) * 11 {
-                idx = (idx << 1) | ((fp[bit / 8] >> (7 - bit % 8)) & 1) as usize;
-            }
-            list[idx]
-        })
-        .collect()
-}
-
-/// libsignal's scannable fingerprint layout (`CombinedFingerprints`).
-#[derive(Clone, PartialEq, prost::Message)]
-struct CombinedFingerprints {
-    #[prost(uint32, optional, tag = "1")]
-    version: Option<u32>,
-    #[prost(message, optional, tag = "2")]
-    local: Option<LogicalFingerprint>,
-    #[prost(message, optional, tag = "3")]
-    remote: Option<LogicalFingerprint>,
-}
-
-#[derive(Clone, PartialEq, prost::Message)]
-struct LogicalFingerprint {
-    #[prost(bytes = "vec", optional, tag = "1")]
-    content: Option<Vec<u8>>,
-}
-
-impl SafetyNumber {
-    /// Both word groups in a canonical order (smaller fingerprint first),
-    /// so both people see the same sequence; the bool marks the local group.
-    pub fn word_groups(&self) -> [(bool, &[&'static str]); 2] {
-        let l = (true, self.local_words.as_slice());
-        let r = (false, self.remote_words.as_slice());
-        if self.local_words <= self.remote_words { [l, r] } else { [r, l] }
-    }
-}
-
-pub fn safety_number(
-    local_user: &[u8],
-    local_master: &[u8],
-    remote_user: &[u8],
-    remote_master: &[u8],
-) -> Result<SafetyNumber> {
-    let fp = Fingerprint::new(
-        2,
-        5200,
-        local_user,
-        &classical_part(local_master)?,
-        remote_user,
-        &classical_part(remote_master)?,
-    )
-    .map_err(|e| anyhow!("fingerprint: {e:?}"))?;
-    let scannable = fp.scannable.serialize().map_err(|e| anyhow!("fingerprint: {e:?}"))?;
-    let combined = CombinedFingerprints::decode(scannable.as_slice())?;
-    let half = |f: Option<LogicalFingerprint>| -> Result<Vec<u8>> {
-        f.and_then(|f| f.content)
-            .filter(|c| c.len() * 8 >= WORDS_PER_PERSON * 11)
-            .ok_or_else(|| anyhow!("unexpected fingerprint layout"))
-    };
-    Ok(SafetyNumber {
-        display: fp.display_string().map_err(|e| anyhow!("fingerprint: {e:?}"))?,
-        local_words: fingerprint_words(&half(combined.local)?),
-        remote_words: fingerprint_words(&half(combined.remote)?),
-        scannable,
-    })
-}
-
-fn classical_part(master_id: &[u8]) -> Result<IdentityKey> {
-    let (c, _) = split_master_id(master_id).ok_or_else(|| anyhow!("malformed master id"))?;
-    Ok(IdentityKey::try_from(c)?)
-}
-
-/// Group a 60-digit safety number into blocks of five for display.
-pub fn format_safety_number(s: &str) -> String {
-    s.as_bytes()
-        .chunks(5)
-        .map(|c| std::str::from_utf8(c).unwrap_or(""))
-        .collect::<Vec<_>>()
-        .chunks(4)
-        .map(|row| row.join(" "))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 // ---------------------------------------------------------------------------
 // Copy-paste codes exchanged out of band
 
-const USER_CODE: &str = "e2eeu1:";
 const LINK_CODE: &str = "e2eed1:";
 const APPROVAL_CODE: &str = "e2eea2:";
-
-pub fn encode_user_code(master_key: &[u8]) -> String {
-    format!("{USER_CODE}{}", B64.encode(master_key))
-}
-
-pub fn decode_user_code(code: &str) -> Result<Vec<u8>> {
-    let raw = code
-        .trim()
-        .strip_prefix(USER_CODE)
-        .ok_or_else(|| anyhow!("not a user code (expected {USER_CODE}...)"))?;
-    let key = B64.decode(raw)?;
-    if key.len() != MASTER_ID_LEN {
-        bail!("user code has the wrong length");
-    }
-    classical_part(&key)?;
-    Ok(key)
-}
 
 /// A new device's identity key and the hashes of its ML-DSA and ML-KEM keys.
 pub fn encode_link_code(device_identity: &[u8], pq_key_hash: &[u8], kem_key_hash: &[u8]) -> String {
@@ -497,79 +366,11 @@ mod tests {
         assert!(verify_device_list(&real, &master_bytes(&m), None).is_ok());
     }
 
-    /// The safety number changes if only the ML-DSA half of the master id does.
-    #[test]
-    fn safety_number_commits_to_pq_key() {
-        let a = MasterKeyPair::generate();
-        let b = MasterKeyPair::generate();
-        let b2 = MasterKeyPair { classical: b.classical, pq_seed: [9; 32] };
-        let (ak, bk, b2k) = (a.id(), b.id(), b2.id());
-        let s1 = safety_number(&user_id_of(&ak), &ak, &user_id_of(&bk), &bk).unwrap();
-        let s2 = safety_number(&user_id_of(&ak), &ak, &user_id_of(&b2k), &b2k).unwrap();
-        assert_ne!(s1.display, s2.display);
-        assert_ne!(s1.remote_words, s2.remote_words);
-    }
-
-    #[test]
-    fn safety_numbers_match_on_both_sides() {
-        let a = MasterKeyPair::generate();
-        let b = MasterKeyPair::generate();
-        let (ak, bk) = (master_bytes(&a), master_bytes(&b));
-        let (au, bu) = (user_id_of(&ak), user_id_of(&bk));
-        let s1 = safety_number(&au, &ak, &bu, &bk).unwrap();
-        let s2 = safety_number(&bu, &bk, &au, &ak).unwrap();
-        assert_eq!(s1.display, s2.display);
-        assert_eq!(s1.display.len(), 60);
-    }
-
-    #[test]
-    fn bip39_list_is_the_canonical_one() {
-        assert_eq!(bip39_words().len(), 2048);
-        assert_eq!(
-            hex::encode(sha256(BIP39_ENGLISH.as_bytes())),
-            "2f5eed53a4727b4bf8880d8f3f199efc90e58503646d9ff8eff3a2ed3b24dbda"
-        );
-    }
-
-    #[test]
-    fn fingerprint_words_encode_11_bit_chunks() {
-        let zeros = [0u8; 32];
-        assert_eq!(fingerprint_words(&zeros), vec!["abandon"; WORDS_PER_PERSON]);
-        let ones = [0xffu8; 32];
-        assert_eq!(fingerprint_words(&ones), vec!["zoo"; WORDS_PER_PERSON]);
-        // First 11 bits = 0b00000000_001 -> index 1 ("ability").
-        let mut fp = [0u8; 32];
-        fp[1] = 0b0010_0000;
-        assert_eq!(fingerprint_words(&fp)[0], "ability");
-    }
-
-    #[test]
-    fn safety_words_match_on_both_sides_and_differ_per_key() {
-        let a = MasterKeyPair::generate();
-        let b = MasterKeyPair::generate();
-        let c = MasterKeyPair::generate();
-        let (ak, bk, ck) = (master_bytes(&a), master_bytes(&b), master_bytes(&c));
-        let (au, bu, cu) = (user_id_of(&ak), user_id_of(&bk), user_id_of(&ck));
-        let ab = safety_number(&au, &ak, &bu, &bk).unwrap();
-        let ba = safety_number(&bu, &bk, &au, &ak).unwrap();
-        assert_eq!(ab.local_words.len(), WORDS_PER_PERSON);
-        assert_eq!(ab.local_words, ba.remote_words);
-        assert_eq!(ab.remote_words, ba.local_words);
-        let groups = |s: &SafetyNumber| s.word_groups().map(|g| g.1.to_vec());
-        assert_eq!(groups(&ab), groups(&ba));
-        // A different remote key changes the remote words.
-        let ac = safety_number(&au, &ak, &cu, &ck).unwrap();
-        assert_eq!(ab.local_words, ac.local_words);
-        assert_ne!(ab.remote_words, ac.remote_words);
-    }
-
     #[test]
     fn codes_roundtrip() {
         let m = MasterKeyPair::generate();
-        let k = master_bytes(&m);
-        assert_eq!(decode_user_code(&encode_user_code(&k)).unwrap(), k);
         let id = m.classical.identity_key().serialize().to_vec();
         assert_eq!(decode_link_code(&encode_link_code(&id, &[3; 32], &[4; 32])).unwrap(), (id, vec![3; 32], vec![4; 32]));
-        assert!(decode_link_code(&encode_user_code(&k)).is_err());
+        assert!(decode_link_code("e2eea2:AAAA").is_err());
     }
 }

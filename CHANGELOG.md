@@ -17,7 +17,7 @@ Users and devices carry over if your local state is from a recent pre-release
 build. If `git e2ee` or `git-e2ee-relay` reports "database migration failed", the
 database is from an older pre-release build: move it aside and start fresh (for
 clients, `~/.local/share/git-e2ee` or `$GIT_E2EE_HOME`, then `git e2ee init-user`
-and verify contacts again; for relays, the `--db` file).
+and add contacts again; for relays, the `--db` file).
 
 **Accounts are per relay.** `git e2ee init-user <relay-url> [--token]` creates your
 account on that relay and registers it; another relay gets another, separate
@@ -38,6 +38,14 @@ invitation until it clones).
 name (`e2ee::https://relay.example/<id>/project`), so `git clone` names its
 directory after it. The name is never sent to the relay; URLs without it still work.
 `member add` prints the clone command.
+
+**Contacts replace verification.** `git e2ee verify` and `git e2ee name` are gone.
+Share your user id (`git e2ee whoami`) over a channel you trust, and add people with
+`git e2ee contact add <name> <user id>`: it fetches their key from the relay and
+checks it hashes to the id. No safety numbers to compare. `member add` and
+`member remove` take contact names. Add each other before inviting, so the first
+clone works at once. User codes (`e2eeu1:`) are gone:
+user ids are the only way to name a user.
 
 Repos made with earlier builds of this pre-release (protocol 2 before rosters
 carried the genesis secret) keep working for their members, but newcomers can't
