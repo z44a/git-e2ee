@@ -29,6 +29,16 @@ approval codes (`e2eea2:`) are short: the new device fetches the signed device l
 from the relay and checks it against the user id. Devices also pick up their
 account's device-list changes from the relay on every sync.
 
+**No more manual `send-history`.** Your devices send repos to your other devices that
+don't have them: a new repo with its first push, and any repo on the next fetch, push
+or `git e2ee sync` of a device that has it (once per device, then re-sent like an
+invitation until it clones).
+
+**Repo names in URLs.** `repo init` ends the remote URL with the repo directory's
+name (`e2ee::https://relay.example/<id>/project`), so `git clone` names its
+directory after it. The name is never sent to the relay; URLs without it still work.
+`member add` prints the clone command.
+
 Repos made with earlier builds of this pre-release (protocol 2 before rosters
 carried the genesis secret) keep working for their members, but newcomers can't
 join them: recreate them the same way.

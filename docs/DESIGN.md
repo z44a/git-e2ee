@@ -1223,7 +1223,7 @@ You are a **user**, identified by a **master key** created on your first device
 the list of your devices. People trust each other by comparing **safety numbers** once;
 after that, devices you add are trusted automatically. A **repo** lives on a **relay**,
 an untrusted server that stores only ciphertext. Its URL looks like
-`e2ee::https://relay.example/<repo id>`. Day-to-day work is plain `git push` / `pull`;
+`e2ee::https://relay.example/<repo id>/<name>`. Day-to-day work is plain `git push` / `pull`;
 `git-e2ee` is only needed for identity, devices and membership.
 
 ### 1. Run a relay (operator)
@@ -1352,7 +1352,11 @@ git push -u origin main
 ```
 
 `repo init` creates a random repo secret, derives the repo id from it, and runs
-`git remote add origin e2ee::https://relay.example/<id>`, all locally. Nothing reaches
+`git remote add origin e2ee::https://relay.example/<id>/<name>`, all locally. `<name>`
+is the repo directory's name (letters, digits, `.`, `-`, `_`; anything else becomes
+`-`), there only so `git clone` names its directory after it. The helper never sends
+it to the relay, and the URL works without it, but it travels wherever you share
+the URL. Nothing reaches
 the relay until the first push (or member change), which anonymously creates the
 repo's log.
 Use `--remote <name>` for another remote name.
@@ -1371,7 +1375,7 @@ This records the membership change in the relay log and sends Bob's devices a
 then clones with plain git:
 
 ```sh
-bob$ git clone e2ee::https://relay.example/<id>
+bob$ git clone e2ee::https://relay.example/<id>/project
 ```
 
 Other members' devices learn about Bob on their next fetch. They trust him because a
@@ -1456,9 +1460,16 @@ trust: whoever's link code you approve **becomes your device**.
 new$    git e2ee device link https://relay.example # prints a link code (e2eed1:…)
 master$ git e2ee device approve e2eed1:…            # signs and publishes a new device list, prints an approval code (e2eea2:…)
 new$    git e2ee device finish e2eea2:…             # joins your account and registers
-master$ cd project && git e2ee send-history        # any existing device works; inside each repo
-new$    git clone e2ee::https://relay.example/<id>
+new$    git clone e2ee::https://relay.example/<id>/project
 ```
+
+The new device gets your repos from your devices that have them: each sends a repo
+(a history bundle, like an invitation) to your devices without it, on its next fetch,
+push or sync, and a new repo goes to your other devices with its first push. Of your
+devices that have the repo, the lowest-numbered one sends; the others step in if the
+device still doesn't have it two days later. Each device is sent a repo once, then
+re-sent like an invitation until it clones (or for 60 days), so a device that left a
+repo isn't offered it again. `git e2ee send-history` in a repo sends it right away.
 
 The approval code is short: your user id, the new device's id, your delivery token
 and the relay. The new device fetches the signed device list from the relay and
@@ -1467,7 +1478,7 @@ the list includes this device's key. A relay can withhold the list (then `finish
 fails and says to approve again) but can't substitute one.
 
 Only the master device (device 1) can approve or revoke devices. `send-history` sends
-the repo state to all your other devices; use `--device <id>` to target one.
+the repo state to all your other devices now; use `--device <id>` to target one.
 Collaborators start encrypting to the new device automatically. Its key is in a list
 signed by your master key, so they don't re-verify, and your safety number doesn't
 change.

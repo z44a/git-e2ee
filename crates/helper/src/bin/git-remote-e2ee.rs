@@ -84,7 +84,8 @@ fn run() -> Result<()> {
                          ask the member who invited you to run `git e2ee member add <your user code>` again\n\
                          (it re-sends the invitation), then run `git clone` again. They must have verified you, and\n\
                          you must have verified them (`git e2ee verify`) and registered with this relay.\n\
-                         For your own new device: run `git e2ee send-history` on an existing one."
+                         For your own device: your device that has the repo sends it on its next fetch, push or\n\
+                         `git e2ee sync` (run one there), then clone again."
                     );
                 };
                 if let Some(c) = &state.conflict {

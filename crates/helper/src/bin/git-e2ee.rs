@@ -321,7 +321,19 @@ fn run(cli: Cli) -> Result<()> {
                 f => bail!("unsupported object format {f}"),
             }
             let eng = rt.block_on(Engine::init_repo(session.device()?, &relay_url, &format))?;
-            let url = format!("e2ee::{}", eng.url());
+            // The directory's name at the end, so `git clone` names its
+            // directory the same (the relay never sees it).
+            let toplevel = std::process::Command::new("git").args(["rev-parse", "--show-toplevel"]).output()?;
+            let name = toplevel
+                .status
+                .success()
+                .then(|| String::from_utf8_lossy(&toplevel.stdout).trim().to_string())
+                .and_then(|p| std::path::Path::new(&p).file_name().map(|n| n.to_string_lossy().into_owned()))
+                .and_then(|n| e2ee_core::engine::url_name(&n));
+            let url = match name {
+                Some(n) => format!("e2ee::{}/{n}", eng.url()),
+                None => format!("e2ee::{}", eng.url()),
+            };
             let st = std::process::Command::new("git").args(["remote", "add", &remote, &url]).status()?;
             if !st.success() {
                 bail!("could not add remote {remote}; add it manually: git remote add {remote} {url}");
@@ -371,15 +383,17 @@ fn run(cli: Cli) -> Result<()> {
                         "{} is already a member but hasn't cloned yet: invitation re-sent to {n} device(s).\n\
                          They can run `git clone {}` now.",
                         short(&uid),
-                        eng.url()
+                        remote.url()?
                     ),
                 }
             } else {
                 rt.block_on(eng.change_roster(Some(Member { user_id: uid.to_vec(), master_key: key }), None))?;
                 println!(
-                    "Added {} and sent them the history. Until they clone, this device re-sends it about weekly \
-                     (when you use the repo); `git e2ee status` shows who hasn't cloned yet.",
-                    short(&uid)
+                    "Added {} and sent them the history. They clone with:\n  git clone {}\n\
+                     Until they clone, this device re-sends it about weekly (when you use the repo); \
+                     `git e2ee status` shows who hasn't cloned yet.",
+                    short(&uid),
+                    remote.url()?
                 );
             }
         }
@@ -713,7 +727,10 @@ fn finish_link(rt: &tokio::runtime::Runtime, code: &str) -> Result<()> {
     let dev = Device::finish_link(&session.db, &approval, &signed)?;
     println!("Linked as device {} of user {} on {}.", dev.device_id, short(&dev.user), relay_host(&relay_url)?);
     register(&session, rt, &relay_url, None)?;
-    println!("Next: for each repo, run `git e2ee send-history` on a device that has it, then clone it here.");
+    println!(
+        "Your devices that have repos send them here on their next fetch, push or `git e2ee sync`; \
+         then clone them here (`git e2ee send-history` in a repo there sends it right away)."
+    );
     Ok(())
 }
 

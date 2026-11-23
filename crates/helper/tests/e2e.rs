@@ -55,6 +55,11 @@ impl TestRelay {
     }
 }
 
+/// The hex repo id in a remote URL (which ends with the repo's name).
+fn rid_of(url: &str) -> String {
+    hex::encode(e2ee_core::engine::parse_url(url).unwrap().1)
+}
+
 fn bin_dir() -> PathBuf {
     Path::new(env!("CARGO_BIN_EXE_git-remote-e2ee")).parent().unwrap().to_path_buf()
 }
@@ -323,7 +328,7 @@ fn relay_split_view_is_detected() {
     assert_eq!(seq, log_seq(&w.bob.status(&w.brepo)));
     w.relay.adversary(|a| a.fork_at = Some(seq));
     // Bob talks to the listener that serves the forked log.
-    let rid = w.url.rsplit('/').next().unwrap();
+    let rid = rid_of(&w.url);
     w.bob.git(&w.brepo, &["remote", "set-url", "origin", &format!("e2ee::{}/{rid}", w.relay.url_fork)]);
 
     commit(&w.alice, &w.arepo, "a.txt", "a\n", "alice on the real log");
@@ -381,7 +386,7 @@ fn full_freeze_is_detected_even_when_the_relay_accepts_our_heartbeats() {
         a.fork_at = Some(seq);
         a.drop_mail_to = w.bob.mailboxes();
     });
-    let rid = w.url.rsplit('/').next().unwrap();
+    let rid = rid_of(&w.url);
     w.bob.git(&w.brepo, &["remote", "set-url", "origin", &format!("e2ee::{}/{rid}", w.relay.url_fork)]);
     commit(&w.alice, &w.arepo, "hidden.txt", "h\n", "hidden");
     w.alice.git(&w.arepo, &["push", "-q"]);
@@ -790,7 +795,7 @@ fn seized_relay_database_links_no_user_to_a_repo() {
     commit(&w.bob, &w.brepo, "b.txt", "b\n", "bob");
     w.bob.git(&w.brepo, &["push", "-q"]);
     let repo_side = w.relay.relay.dump_tables(&["repos", "repo_tokens", "logs", "blobs"]);
-    let rid = w.url.rsplit('/').next().unwrap();
+    let rid = rid_of(&w.url);
     assert!(repo_side.windows(rid.len()).any(|x| x == rid.as_bytes()), "sanity: the repo is stored");
     for user in [w.alice.user_hex(), w.bob.user_hex()] {
         let raw = hex::decode(&user).unwrap();
@@ -1190,7 +1195,7 @@ fn forgetting_a_repo_removes_local_state_and_ignores_its_mail() {
 
     w.bob.e2ee(&w.brepo, &["repo", "forget", "--yes"]);
     assert!(w.bob.status(&w.brepo).contains("no state for this repo"));
-    let rid = w.url.rsplit('/').next().unwrap();
+    let rid = rid_of(&w.url);
     assert!(!w.bob.acct().join("mirrors").join(format!("{rid}.git")).exists());
     commit(&w.alice, &w.arepo, "after.txt", "x\n", "x");
     w.alice.git(&w.arepo, &["push", "-q"]);
@@ -1666,6 +1671,67 @@ fn linked_devices_pick_up_device_list_changes_on_sync() {
     assert!(approval.len() < 200, "{}", approval.len());
 }
 
+/// Your own devices get repos without `send-history`: one linked before the
+/// repo existed gets it with the first push, one linked later with the next
+/// sync of a device that has it. Each is sent the repo once.
+#[test]
+fn own_devices_get_repos_without_send_history() {
+    let w = world();
+    let link = |name: &str| {
+        let d = Dev::new(&w.root, name);
+        let code = code_from(&d.e2ee(&w.root, &["device", "link", &w.relay.url]), "e2eed1:");
+        let approval = code_from(&w.alice.e2ee(&w.arepo, &["device", "approve", &code]), "e2eea2:");
+        d.e2ee(&w.root, &["device", "finish", &approval]);
+        d
+    };
+    // Linked first, then Alice makes a new repo and pushes.
+    let laptop = link("alice-laptop");
+    let repo = w.root.join("fresh");
+    w.alice.git(&w.root, &["init", "-q", "--object-format=sha256", repo.to_str().unwrap()]);
+    commit(&w.alice, &repo, "f", "f\n", "f");
+    w.alice.e2ee(&repo, &["repo", "init", &w.relay.url]);
+    let out = w.alice.ok("git", &repo, &["push", "-u", "origin", "main"]);
+    assert!(out.contains("sent this repo to your device 2"), "{out}");
+    let url = w.alice.git(&repo, &["remote", "get-url", "origin"]).trim().to_string();
+    let lrepo = w.root.join("fresh-laptop");
+    laptop.git(&w.root, &["clone", "-q", &url, lrepo.to_str().unwrap()]);
+    assert!(lrepo.join("f").exists());
+
+    // Linked after the repo: Alice's next sync sends it, only once (to the
+    // laptop too, which never had this repo).
+    let phone = link("alice-phone");
+    let out = w.alice.e2ee(&w.arepo, &["sync"]);
+    assert!(out.contains("sent this repo to your device 2, 3"), "{out}");
+    let again = w.alice.e2ee(&w.arepo, &["sync"]);
+    assert!(!again.contains("sent this repo"), "{again}");
+    let prepo = w.root.join("phone-repo");
+    phone.git(&w.root, &["clone", "-q", &w.url, prepo.to_str().unwrap()]);
+    assert!(prepo.join("plans.txt").exists());
+}
+
+/// `repo init` ends the remote URL with the directory's name, so a plain
+/// `git clone` names its directory after the repo; the relay never sees it.
+#[test]
+fn clone_names_the_directory_after_the_repo() {
+    let w = world();
+    assert!(w.url.ends_with("/arepo"), "{}", w.url);
+    let dana = Dev::new(&w.root, "dana");
+    let dana_code = dana.init_user(&w.relay.url);
+    let alice_code = code_from(&w.alice.e2ee(&w.arepo, &["whoami"]), "e2eeu1:");
+    w.alice.e2ee(&w.root, &["verify", &dana_code, "--yes"]);
+    dana.e2ee(&w.root, &["verify", &alice_code, "--yes"]);
+    let out = w.alice.e2ee(&w.arepo, &["member", "add", &dana_code]);
+    assert!(out.contains(&format!("git clone {}", w.url)), "{out}");
+    let dir = w.root.join("dana-clones");
+    std::fs::create_dir(&dir).unwrap();
+    dana.git(&dir, &["clone", "-q", &w.url]);
+    assert!(dir.join("arepo").join("plans.txt").exists());
+    // The URL without the name works the same.
+    let bare = w.url.trim_end_matches("/arepo").to_string();
+    dana.git(&dir, &["clone", "-q", &bare, "plain"]);
+    assert!(dir.join("plain").join("plans.txt").exists());
+}
+
 /// Registering shows the relay's policy.
 #[test]
 fn register_prints_the_relay_policy() {
@@ -1988,7 +2054,7 @@ fn concurrent_rotations_never_lock_members_out() {
     assert!(a.status.success() || b.status.success(), "neither removal went through:\n{}\n{}", stderr(&a), stderr(&b));
     let tokens = w.relay.relay.dump_tables(&["repo_tokens"]);
     // One row: the repo id and one token hash (64 hex).
-    let rid = w.url.rsplit('/').next().unwrap();
+    let rid = rid_of(&w.url);
     assert_eq!(tokens.len(), rid.len() + 64, "expected exactly one repo token");
     for (dev, repo) in [(&w.alice, &w.arepo), (&w.bob, &w.brepo)] {
         dev.e2ee(repo, &["sync"]);
@@ -2091,7 +2157,7 @@ fn a_fake_newer_protocol_entry_is_caught_as_a_fork() {
     w.bob.e2ee(&w.brepo, &["sync"]);
     let seq = log_seq(&w.alice.status(&w.arepo));
     w.relay.adversary(|a| a.fork_at = Some(seq));
-    let rid = w.url.rsplit('/').next().unwrap().to_string();
+    let rid = rid_of(&w.url);
     w.bob.git(&w.brepo, &["remote", "set-url", "origin", &format!("e2ee::{}/{rid}", w.relay.url_fork)]);
     w.relay.relay.append_raw_to_fork_for_tests(&rid, 1, |seq, head| {
         use e2ee_proto::Message;

@@ -299,11 +299,16 @@ git push -u origin main
 git e2ee member add e2eeu1:<their user code>
 ```
 
-They clone with plain git:
+They clone with plain git (`member add` prints the command):
 
 ```sh
-git clone e2ee::https://relay.example/<repo id>
+git clone e2ee::https://relay.example/<repo id>/project
 ```
+
+The URL ends with the repo's directory name (`project` here), so `git clone` names
+its directory the same. The name is only in the URL: it's never sent to the relay,
+but anyone you share the URL with sees it. Without it
+(`e2ee::https://relay.example/<repo id>`) the URL works the same.
 
 **5. Work as usual:** `git pull`, `git push`, `git push --force-with-lease`, and so on.
 
@@ -323,9 +328,13 @@ Add a device (the codes must travel over a channel you trust):
 new$    git e2ee device link https://relay.example   # prints a link code
 master$ git e2ee device approve <link code>          # prints an approval code
 new$    git e2ee device finish <approval code>       # joins your account and registers
-master$ git e2ee send-history                        # inside each repo
-new$    git clone e2ee::https://relay.example/<repo id>
+new$    git clone e2ee::https://relay.example/<repo id>/project
 ```
+
+Your devices send each other the repos they have: a device that has a repo sends it
+to your devices that don't on its next fetch, push or `git e2ee sync` (and a new repo
+goes to your other devices with its first push). To send it right away, run `git e2ee
+send-history` in the repo on a device that has it.
 
 If a device is lost or retired, revoke it from your first device (the *master
 device*):

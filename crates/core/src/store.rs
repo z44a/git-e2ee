@@ -107,7 +107,7 @@ const PRAGMAS: &str = "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAG
 
 /// Schema migrations, in order (see `e2ee_proto::migrate`). Append new ones;
 /// never edit a released one.
-const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5];
+const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6];
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v BLOB NOT NULL);
@@ -238,6 +238,12 @@ const SCHEMA_V5: &str = r#"
 -- was lost (an invitation re-sent after the relay expired the first one).
 ALTER TABLE pq_keys ADD COLUMN resp BLOB;
 CREATE TABLE pending_invites (repo_id BLOB NOT NULL, user BLOB NOT NULL, device_id INTEGER NOT NULL, first_ms INTEGER NOT NULL, sent_ms INTEGER NOT NULL, sends INTEGER NOT NULL, blob_ids TEXT NOT NULL, pack_key BLOB NOT NULL, PRIMARY KEY (repo_id, user, device_id));
+"#;
+
+const SCHEMA_V6: &str = r#"
+-- Our own other devices this device has seen without the repo (first_ms) and
+-- whether it sent them the repo (offered), so it's offered once, not forever.
+CREATE TABLE own_offers (repo_id BLOB NOT NULL, device_id INTEGER NOT NULL, first_ms INTEGER NOT NULL, offered INTEGER NOT NULL, PRIMARY KEY (repo_id, device_id));
 "#;
 
 /// Exclusive lock on the device state, held for a whole CLI or helper run so

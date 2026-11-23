@@ -67,11 +67,38 @@ pub struct SyncReport {
     pub behind: Option<String>,
 }
 
+/// `<relay-url>/<repo-id>[/<name>]`: the relay and repo id. The optional
+/// name is only there so `git clone` names the directory after it; it's
+/// never sent to the relay.
 pub fn parse_url(url: &str) -> Result<(String, Vec<u8>)> {
     let url = url.strip_prefix("e2ee::").unwrap_or(url).trim_end_matches('/');
-    let (base, rid) = url.rsplit_once('/').ok_or_else(|| anyhow!("remote url must be <relay-url>/<repo-id>"))?;
-    let rid = hex::decode(rid).ok().filter(|r| r.len() == 16).ok_or_else(|| anyhow!("bad repo id in url"))?;
+    let bad = || anyhow!("remote url must be <relay-url>/<repo-id>, optionally followed by /<name>: {url:?}");
+    let rid_of = |s: &str| hex::decode(s).ok().filter(|r| r.len() == 16);
+    let (base, last) = url.rsplit_once('/').ok_or_else(bad)?;
+    if let Some(rid) = rid_of(last) {
+        return Ok((base.to_string(), rid));
+    }
+    let (base, rid) = base.rsplit_once('/').ok_or_else(bad)?;
+    let rid = rid_of(rid).ok_or_else(bad)?;
     Ok((base.to_string(), rid))
+}
+
+/// The name `repo init` puts at the end of the remote URL, from the repo's
+/// directory name: letters, digits, `.`, `-` and `_` (anything else becomes
+/// `-`), so it's safe in a URL and as a directory name. None if nothing is
+/// left.
+pub fn url_name(dir_name: &str) -> Option<String> {
+    let name: String = dir_name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || "._-".contains(c) { c } else { '-' })
+        .collect();
+    let name = name.trim_start_matches('.').trim_matches('-');
+    (!name.is_empty() && rid_name_ok(name)).then(|| name.to_string())
+}
+
+/// A name that parses back as the name, not as a repo id.
+fn rid_name_ok(name: &str) -> bool {
+    !(name.len() == 32 && name.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 fn env_secs(name: &str, default: u64) -> u64 {
@@ -1390,6 +1417,9 @@ impl Engine {
         }
         if let Err(e) = self.resend_invites(&mut report).await {
             report.warnings.push(format!("could not re-send an invitation: {e:#}"));
+        }
+        if let Err(e) = self.offer_own_devices(&mut report.notes).await {
+            report.warnings.push(format!("could not send this repo to your other devices: {e:#}"));
         }
         self.freshness(&mut report).await?;
         self.gossip()?;
@@ -3292,6 +3322,14 @@ impl Engine {
                 .map(|(d, r)| (d, r.and(Err("fetch first".to_string()))))
                 .collect());
         }
+        // The first push of a new repo: our other devices can have it now.
+        let mut notes = vec![];
+        if let Err(e) = self.offer_own_devices(&mut notes).await {
+            notes.push(format!("could not send this repo to your other devices: {e:#}"));
+        }
+        for n in notes {
+            eprintln!("e2ee: {}", crate::printable(&n));
+        }
         Ok(results)
     }
 
@@ -3560,6 +3598,16 @@ impl Engine {
             hb.refs.push(RefEntry { name: "refs/heads/bad name".into(), oid: "0".repeat(64) });
         }
         self.queue(to, &self.envelope(Body::HistoryBundle(hb)))?;
+        // Our own devices have been offered the repo now (see `offer_own_devices`).
+        for (u, d) in to {
+            if *u == self.dev.user {
+                self.db().execute(
+                    "INSERT INTO own_offers (repo_id, device_id, first_ms, offered) VALUES (?1, ?2, ?3, 1)
+                     ON CONFLICT (repo_id, device_id) DO UPDATE SET offered = 1",
+                    params![self.repo_id, *d as i64, now_ms() as i64],
+                )?;
+            }
+        }
         let mut w = vec![];
         self.flush_outbox(&mut w).await?;
         for w in w {
@@ -3676,6 +3724,72 @@ impl Engine {
             let ids: Vec<String> = ids.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect();
             self.delete_blobs(&ids, &key).await;
         }
+        Ok(())
+    }
+
+    /// Send the repo to our own devices that don't have it (a repo made
+    /// after they were linked, or a device linked after the repo), so nobody
+    /// needs `git e2ee send-history`. Once per device and repo: re-sending
+    /// is then the invitation's (`resend_invites`), and a device that gave
+    /// the repo up isn't offered it again. Of our devices that have the
+    /// repo, the lowest-numbered sends; the others only if the device still
+    /// lacks it two days later (`E2EE_OWN_OFFER_FALLBACK_SECS`), in case
+    /// that one is rarely used. Not before the log has its first entry.
+    async fn offer_own_devices(&mut self, notes: &mut Vec<String>) -> Result<()> {
+        let Some(s) = self.state()? else { return Ok(()) };
+        if s.conflict.is_some() || s.seq == 0 {
+            return Ok(());
+        }
+        let me = self.dev.user.clone();
+        let mine: Vec<u32> = self.dev.db.devices_of(&me)?.into_iter().map(|(d, _)| d).collect();
+        let mut joined = vec![self.dev.device_id];
+        for &d in &mine {
+            if d != self.dev.device_id && self.device_joined(&me, d)? {
+                joined.push(d);
+            }
+        }
+        let first_sender = joined.iter().min() == Some(&self.dev.device_id);
+        let (now, fallback) = (now_ms(), env_secs("E2EE_OWN_OFFER_FALLBACK_SECS", 2 * 86_400) * 1000);
+        let mut due = vec![];
+        for &d in &mine {
+            if joined.contains(&d) {
+                continue;
+            }
+            let row: Option<(i64, bool)> = self
+                .db()
+                .query_row(
+                    "SELECT first_ms, offered FROM own_offers WHERE repo_id = ?1 AND device_id = ?2",
+                    params![self.repo_id, d as i64],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let first = match row {
+                Some((_, true)) => continue,
+                Some((first, false)) => first as u64,
+                None => {
+                    self.db().execute(
+                        "INSERT INTO own_offers (repo_id, device_id, first_ms, offered) VALUES (?1, ?2, ?3, 0)",
+                        params![self.repo_id, d as i64, now as i64],
+                    )?;
+                    now
+                }
+            };
+            if first_sender || now.saturating_sub(first) >= fallback {
+                due.push((me.clone(), d));
+            }
+        }
+        if due.is_empty() {
+            return Ok(());
+        }
+        self.resend_to(&due).await?;
+        for (_, d) in &due {
+            self.db().execute(
+                "UPDATE own_offers SET offered = 1 WHERE repo_id = ?1 AND device_id = ?2",
+                params![self.repo_id, *d as i64],
+            )?;
+        }
+        let ids: Vec<String> = due.iter().map(|(_, d)| d.to_string()).collect();
+        notes.push(format!("sent this repo to your device {}: it can clone it now", ids.join(", ")));
         Ok(())
     }
 
@@ -3904,7 +4018,7 @@ impl Engine {
         for table in [
             "repos", "repo_secrets", "history", "inbox", "outbox", "own_entries", "acks", "resend_requests",
             "peer_heartbeats", "peer_contact", "peer_sent", "own_mailboxes", "peer_mailboxes",
-            "claim_entries", "history_claims", "history_requests", "claims_for_me",
+            "claim_entries", "history_claims", "history_requests", "claims_for_me", "pending_invites", "own_offers",
         ] {
             c.execute(&format!("DELETE FROM {table} WHERE repo_id = ?1"), [&self.repo_id])?;
         }
@@ -4390,6 +4504,28 @@ pub fn pick_head(current: &str, refs: &[RefEntry]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn urls_may_end_with_a_name() {
+        let rid = "04244ab0f5ab3f21b9365e564af8d07d";
+        for url in [
+            format!("e2ee::https://relay.example/{rid}"),
+            format!("e2ee::https://relay.example/{rid}/"),
+            format!("e2ee::https://relay.example/{rid}/project"),
+            format!("https://relay.example/{rid}/my.repo_2/"),
+        ] {
+            let (base, id) = super::parse_url(&url).unwrap();
+            assert_eq!((base.as_str(), hex::encode(id).as_str()), ("https://relay.example", rid), "{url}");
+        }
+        let (base, _) = super::parse_url(&format!("https://h.example/sub/{rid}/x")).unwrap();
+        assert_eq!(base, "https://h.example/sub");
+        assert!(super::parse_url("https://relay.example/project").is_err());
+        assert!(super::parse_url(&format!("https://relay.example/{rid}/a/b")).is_err());
+        assert_eq!(super::url_name("My Project!").as_deref(), Some("My-Project"));
+        assert_eq!(super::url_name(".hidden").as_deref(), Some("hidden"));
+        assert_eq!(super::url_name("日本"), None);
+        assert_eq!(super::url_name(rid), None);
+    }
+
 
     #[test]
     fn log_timer_durations_parse_and_print() {
