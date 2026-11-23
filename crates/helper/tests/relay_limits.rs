@@ -170,9 +170,9 @@ async fn linked_devices_of_a_registered_user_need_no_token() {
 
     let new_db = Db::open_in_memory().unwrap();
     let link = Device::begin_link(&new_db).unwrap();
-    let (signed, approval, _) = master.approve_link(&link).unwrap();
+    let (signed, approval, _) = master.approve_link(&link, &url).unwrap();
     c.put_device_list(&hex::encode(&master.user), &e2ee_proto::Message::encode_to_vec(&signed)).await.unwrap();
-    let mut laptop = Device::finish_link(&new_db, &approval).unwrap();
+    let mut laptop = Device::finish_link(&new_db, &e2ee_core::identity::decode_approval(&approval).unwrap(), &signed).unwrap();
     let lup = laptop.key_upload(1, 0, true).await.unwrap();
     c.upload_keys(&auth(&laptop), &lup, None).await.unwrap();
     let _ = master.key_upload(0, 0, false).await.unwrap();
@@ -846,9 +846,9 @@ async fn token_budget_is_per_user_and_resets_on_a_ban() {
     let master = registered(&c).await;
     let new_db = Db::open_in_memory().unwrap();
     let link = Device::begin_link(&new_db).unwrap();
-    let (signed, approval, _) = master.approve_link(&link).unwrap();
+    let (signed, approval, _) = master.approve_link(&link, &url).unwrap();
     c.put_device_list(&hex::encode(&master.user), &e2ee_proto::Message::encode_to_vec(&signed)).await.unwrap();
-    let mut laptop = Device::finish_link(&new_db, &approval).unwrap();
+    let mut laptop = Device::finish_link(&new_db, &e2ee_core::identity::decode_approval(&approval).unwrap(), &signed).unwrap();
     let lup = laptop.key_upload(1, 0, true).await.unwrap();
     c.upload_keys(&auth(&laptop), &lup, None).await.unwrap();
     issue(&c, &master, 3).await.unwrap();

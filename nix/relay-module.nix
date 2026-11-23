@@ -93,14 +93,14 @@ in
       type = lib.types.nullOr lib.types.str;
       default = null;
       example = "abuse@example.com";
-      description = "Contact address shown in the default policy (`git e2ee register` shows it).";
+      description = "Contact address shown in the default policy (`git e2ee init-user` shows it).";
     };
 
     policy = lib.mkOption {
       type = lib.types.nullOr lib.types.lines;
       default = null;
       description = ''
-        This relay's policy, shown to users when they run `git e2ee register`
+        This relay's policy, shown to users when they run `git e2ee init-user`
         (it goes into the Nix store: it's public anyway). Null: `policyFile`,
         or the default (a repeat-infringer policy plus `contact`).
       '';

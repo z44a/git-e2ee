@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use libsignal_protocol::{
     Direction, GenericSignedPreKey, IdentityChange, IdentityKey, IdentityKeyPair,
@@ -24,6 +24,80 @@ pub fn data_dir() -> Result<PathBuf> {
     }
     let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
     Ok(PathBuf::from(home).join(".local/share/git-e2ee"))
+}
+
+/// The account key for a relay: its host, without port, path or scheme, so
+/// the same relay reached directly or through a proxy is one account.
+/// `https://relay.example:8443/x` → `relay.example`; `http://[::1]:8470` → `___1_`.
+pub fn relay_host(relay_url: &str) -> Result<String> {
+    let rest = relay_url.split_once("://").map(|x| x.1).ok_or_else(|| anyhow!("not a relay URL: {relay_url:?}"))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("").to_ascii_lowercase();
+    let authority = authority.rsplit_once('@').map_or(authority.as_str(), |x| x.1);
+    let host = if let Some(v6) = authority.strip_prefix('[') {
+        format!("[{}]", v6.split(']').next().unwrap_or(""))
+    } else {
+        authority.split(':').next().unwrap_or("").to_string()
+    };
+    // (A directory name: no "..", nothing hidden, only host characters.)
+    let first_ok = host.chars().next().is_some_and(|c| c.is_ascii_alphanumeric() || c == '[');
+    if !first_ok || host == "[]" || !host.chars().all(|c| c.is_ascii_alphanumeric() || ".-_[]:".contains(c)) {
+        bail!("not a relay URL: {relay_url:?}");
+    }
+    Ok(host.replace([':', '[', ']'], "_"))
+}
+
+/// The state directory of the account on this relay. Each relay has its own
+/// account (master key, devices, contacts, repos), so accounts on different
+/// relays share nothing and can't be linked by the relays.
+///
+/// State from before accounts were per relay (one identity, at the top of
+/// the data directory) stays the account for the relays it registered with.
+pub fn account_dir(relay_url: &str) -> Result<PathBuf> {
+    let base = data_dir()?;
+    let host = relay_host(relay_url)?;
+    let dir = base.join("accounts").join(&host);
+    if dir.exists() {
+        return Ok(dir);
+    }
+    if legacy_hosts(&base)?.contains(&host) {
+        return Ok(base);
+    }
+    Ok(dir)
+}
+
+/// Every account on this machine: (relay host, state directory).
+pub fn accounts() -> Result<Vec<(String, PathBuf)>> {
+    let base = data_dir()?;
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(base.join("accounts")) {
+        for e in rd.flatten() {
+            if e.path().join("device.sqlite").exists() {
+                out.push((e.file_name().to_string_lossy().into_owned(), e.path()));
+            }
+        }
+    }
+    for h in legacy_hosts(&base)? {
+        if !out.iter().any(|(x, _)| *x == h) {
+            out.push((h, base.clone()));
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Relay hosts the pre-accounts identity (if any) is registered with.
+fn legacy_hosts(base: &Path) -> Result<Vec<String>> {
+    let db = base.join("device.sqlite");
+    if !db.exists() {
+        return Ok(vec![]);
+    }
+    let conn = Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut st = match conn.prepare("SELECT url FROM relays") {
+        Ok(st) => st,
+        Err(_) => return Ok(vec![]),
+    };
+    let urls: Vec<String> = st.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    Ok(urls.iter().filter_map(|u| relay_host(u).ok()).collect())
 }
 
 /// Per-connection settings (not part of the schema).
@@ -907,6 +981,24 @@ impl KyberPreKeyStore for SqlKyberStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accounts_are_keyed_by_relay_host() {
+        for (url, host) in [
+            ("https://relay.example", "relay.example"),
+            ("https://Relay.Example:8443/x", "relay.example"),
+            ("http://127.0.0.1:8470", "127.0.0.1"),
+            ("http://[::1]:8470/r", "___1_"),
+        ] {
+            assert_eq!(relay_host(url).unwrap(), host, "{url}");
+        }
+        assert!(relay_host("relay.example").is_err());
+        for bad in ["https://../x", "https://./x", "https://.hidden", "https://", "https://a/b"] {
+            let r = relay_host(bad);
+            assert!(r.as_ref().map_or(true, |h| h == "a"), "{bad}: {r:?}");
+        }
+        assert!(relay_host("https://../x").is_err());
+    }
 
     /// The last prototype shape (a delivery token column on `pq_keys`)
     /// migrates to version 2 with its keys.

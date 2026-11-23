@@ -319,7 +319,7 @@ with are trusted.
   this rare, handshakes start eagerly:
   - on `git e2ee verify`, with the verified user's devices (this fetches their
     device list from the relay, without saying who asks);
-  - on `git e2ee register`, with our own other devices;
+  - on `git e2ee init-user`, `device finish` and `register`, with our own other devices;
   - on every sync, with member devices we have no key with.
 
   What remains: a new member's or device's first push to someone waits until that
@@ -381,7 +381,7 @@ with are trusted.
   member switches the repo with a roster change that raises `Roster.protocol`, and
   from that log entry on everyone writes the new format. Roster changes can't lower
   it, so a member can't force a downgrade.
-- Codes carry their own version (`e2eeu1:`, `e2eed1:`, `e2eea1:`), and every
+- Codes carry their own version (`e2eeu1:`, `e2eed1:`, `e2eea2:`), and every
   domain-separation string contains `v1`. A new version that changes a hash or
   signature input gets new strings, so nothing signed under one version verifies
   under another.
@@ -1287,30 +1287,34 @@ mail, not repositories (every member has a full copy).
 
 ### 2. Set up each device (everyone)
 
-On your **first** device:
+On your **first** device, create your account on the relay:
 
 ```sh
-git e2ee init-user
+git e2ee init-user https://relay.example
+git e2ee init-user https://relay.example --token <token>   # invite-only relays
 ```
 
-This creates your master key and makes this device 1. It prints your **user code**
-(`e2eeu1:…`), which is safe to share: it's your public master key. `git e2ee whoami`
-prints it again.
+This creates your master key, makes this device 1, and registers it: it uploads your
+signed device list and prekeys (including post-quantum Kyber prekeys). After this,
+prekeys are rotated and topped up automatically whenever you use the relay. It prints
+your **user code** (`e2eeu1:…`), which is safe to share: it's your public master key.
+`git e2ee whoami` prints it again.
 
-Then publish this device's keys to each relay you'll use:
+**An account belongs to one relay.** On another relay, `init-user` creates another
+account: a separate user with its own master key, user code, devices and contacts.
+Accounts share nothing, so relays (or anyone who seizes several) can't link them, and
+"who am I here" is always the relay's account. A person on two relays is two users,
+and collaborators verify each one separately. The account is picked by the relay:
+a repo's remote URL for repo commands and git, otherwise `--relay <url>`, the current
+repo's relay, or your only account. `git e2ee accounts` lists them. The account key
+is the relay's host name (without port), so the same relay reached directly or
+through a proxy is one account.
 
-```sh
-git e2ee register https://relay.example
-git e2ee register https://relay.example --token <token>   # invite-only relays, once per user
-```
-
-This uploads your signed device list and prekeys (including post-quantum Kyber
-prekeys). Others can't add you to a repo on a relay you haven't registered with. After
-this, prekeys are rotated and topped up automatically whenever you use the relay.
-
-State lives in `~/.local/share/git-e2ee` (override with `GIT_E2EE_HOME`). It contains
-your private keys: don't sync it to cloud storage or back it up casually (see "What we
-do not uphold").
+State lives in `~/.local/share/git-e2ee/accounts/<relay host>/` (the base can be
+overridden with `GIT_E2EE_HOME`). An identity created before accounts were per relay
+(at the top of that directory) stays the account for the relays it registered with.
+The state contains your private keys: don't sync it to cloud storage or back it up
+casually (see "What we do not uphold").
 
 ### 3. Verify the people you work with
 
@@ -1449,13 +1453,18 @@ Linking needs both devices and two copy-pastes. Move the codes over a channel yo
 trust: whoever's link code you approve **becomes your device**.
 
 ```sh
-new$    git e2ee device link                       # prints a link code (e2eed1:…)
-master$ git e2ee device approve e2eed1:…            # signs a new device list, prints an approval code (e2eea1:…)
-new$    git e2ee device finish e2eea1:…             # joins your identity
-new$    git e2ee register https://relay.example
+new$    git e2ee device link https://relay.example # prints a link code (e2eed1:…)
+master$ git e2ee device approve e2eed1:…            # signs and publishes a new device list, prints an approval code (e2eea2:…)
+new$    git e2ee device finish e2eea2:…             # joins your account and registers
 master$ cd project && git e2ee send-history        # any existing device works; inside each repo
 new$    git clone e2ee::https://relay.example/<id>
 ```
+
+The approval code is short: your user id, the new device's id, your delivery token
+and the relay. The new device fetches the signed device list from the relay and
+accepts it only if its master key hashes to that user id, the signature verifies, and
+the list includes this device's key. A relay can withhold the list (then `finish`
+fails and says to approve again) but can't substitute one.
 
 Only the master device (device 1) can approve or revoke devices. `send-history` sends
 the repo state to all your other devices; use `--device <id>` to target one.
@@ -1471,7 +1480,8 @@ master$ git e2ee device revoke <device id>
 ```
 
 Revocation publishes a new signed device list without that device and immediately
-messages the members of every repo you're in. Every message carries the new list, so
+messages the members of every repo you're in. Your other devices pick the new list up
+from the relay on their next sync (and from those messages). Every message carries the new list, so
 members stop encrypting to the revoked device as soon as they receive it, even if the
 relay keeps serving the old list. An honest relay also drops the device's registration. Anything
 the device already had stays on it. If it was stolen, treat that data as exposed.
@@ -1479,7 +1489,7 @@ the device already had stays on it. If it was stolen, treat that data as exposed
 **If you lose the master device**, you can't approve or revoke devices any more. Your
 other devices keep working, but there's no recovery of the master key (by design, it
 exists only on device 1). To regain control, create a new user with
-`git e2ee init-user` on a fresh device. Have your collaborators verify the new
+`git e2ee init-user <relay>` on a fresh device. Have your collaborators verify the new
 identity, add it, and remove the old one.
 
 ### 9. Remove a member
@@ -1530,7 +1540,7 @@ the remaining members learn the new token from your next message.
 | `e2ee.pseudonym` | `Name <email>` that commits are expected to use; mismatches warn. |
 | `e2ee.requirePseudonym` | Turn pseudonym mismatches into errors. |
 | `e2ee.pushLog` | Record who changed which refs (`git e2ee log`). Default `true`. |
-| `GIT_E2EE_HOME` | Device state directory (default `~/.local/share/git-e2ee`). |
+| `GIT_E2EE_HOME` | Device state directory (default `~/.local/share/git-e2ee`); each account in `accounts/<relay host>/`. |
 | `E2EE_HEARTBEAT_SECS` | Heartbeat interval (default 86400). |
 | `E2EE_MAX_STALENESS_SECS` | Freeze-warning threshold (default 604800). |
 | `E2EE_RESEND_SECS` | Minimum interval between resend requests (default 30). |
@@ -1555,7 +1565,7 @@ the remaining members learn the new token from your next message.
 * **Mirror repo.** `git clone` only switches a new repository to the repo's object
   format after the helper's `list` returns, so the helper imports packs into a
   per-device bare mirror in that format (created once the format is known from the
-  history bundle) (`$GIT_E2EE_HOME/mirrors/<repo-id>.git`) and copies the requested objects into
+  history bundle) (`<account dir>/mirrors/<repo-id>.git`) and copies the requested objects into
   the working repository on `fetch`. This doubles disk usage.
 * **One clone per repo per device.** Replication state is keyed by repo id in the
   device database, so two clones of the same repo on one device would share one state.

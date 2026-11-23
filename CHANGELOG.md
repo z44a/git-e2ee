@@ -19,6 +19,16 @@ database is from an older pre-release build: move it aside and start fresh (for
 clients, `~/.local/share/git-e2ee` or `$GIT_E2EE_HOME`, then `git e2ee init-user`
 and verify contacts again; for relays, the `--db` file).
 
+**Accounts are per relay.** `git e2ee init-user <relay-url> [--token]` creates your
+account on that relay and registers it; another relay gets another, separate
+account (user, devices, contacts), kept in `~/.local/share/git-e2ee/accounts/<host>/`.
+Commands pick the account from the repo's remote, or `--relay <url>`; `git e2ee
+accounts` lists them. An existing identity keeps working on the relays it's
+registered with. `device link` now takes the relay, `device finish` registers, and
+approval codes (`e2eea2:`) are short: the new device fetches the signed device list
+from the relay and checks it against the user id. Devices also pick up their
+account's device-list changes from the relay on every sync.
+
 Repos made with earlier builds of this pre-release (protocol 2 before rosters
 carried the genesis secret) keep working for their members, but newcomers can't
 join them: recreate them the same way.

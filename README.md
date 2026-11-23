@@ -262,12 +262,20 @@ cargo install --locked --path crates/relay    # git-e2ee-relay
 
 ## Quick start
 
-**1. Set up each device** (once):
+**1. Create your account on the relay** (once; for more devices see "Your devices"):
 
 ```sh
-git e2ee init-user                          # creates your identity; prints your user code (e2eeu1:…)
-git e2ee register https://relay.example     # add --token <token> if the relay is invite-only
+git e2ee init-user https://relay.example    # add --token <token> if the relay is invite-only
 ```
+
+This prints your user code (`e2eeu1:…`), which you share with collaborators.
+
+**Accounts are per relay.** Your account on another relay is a separate user, with
+its own master key, user code, devices and contacts, and the relays can't link the
+two. Collaborators on each relay verify that relay's code. A repo uses the account of
+its remote's relay. Commands that aren't about a repo (`whoami`, `verify`, `device
+…`) use the current repo's relay, or your only account; with several, pick one with
+`--relay <url>`. `git e2ee accounts` lists them.
 
 **2. Verify your collaborators.** Both of you run this, and compare the safety number
 in person or on a call:
@@ -312,11 +320,10 @@ scheduled job (cron, a systemd timer) that runs `git e2ee sync` in each repo avo
 Add a device (the codes must travel over a channel you trust):
 
 ```sh
-new$    git e2ee device link                  # prints a link code
-master$ git e2ee device approve <link code>   # prints an approval code
-new$    git e2ee device finish <approval code>
-new$    git e2ee register https://relay.example
-master$ git e2ee send-history                 # inside each repo
+new$    git e2ee device link https://relay.example   # prints a link code
+master$ git e2ee device approve <link code>          # prints an approval code
+new$    git e2ee device finish <approval code>       # joins your account and registers
+master$ git e2ee send-history                        # inside each repo
 new$    git clone e2ee::https://relay.example/<repo id>
 ```
 
@@ -362,11 +369,12 @@ manual for now.
 
 | Command | Purpose |
 |---|---|
-| `init-user`, `whoami` | Create or show your identity and user code |
+| `init-user <relay> [--token]`, `whoami` | Create your account on a relay; show its user code |
+| `accounts` | List your accounts (one per relay) |
 | `verify <code> [--name <name>]` | Compare safety numbers and trust a collaborator |
 | `name <code or id> <name>` | Name a contact (only on this device); names are shown instead of user IDs |
-| `register <relay> [--token]` | Make this device reachable on a relay |
-| `device link / approve / finish / revoke / list` | Manage your devices |
+| `register <relay> [--token]` | Register this device with its account's relay again (e.g. with a token) |
+| `device link <relay> / approve / finish / revoke / list` | Manage your devices |
 | `repo init <relay> [--allow-sha1]` | Create a repo |
 | `repo leave`, `repo forget` | Leave a repo (all your devices); drop it from this device only |
 | `member add / remove / list` | Manage who is in a repo |
@@ -470,7 +478,7 @@ Environment:
 
 | Variable | Meaning |
 |---|---|
-| `GIT_E2EE_HOME` | Where this device's keys and state live (default `~/.local/share/git-e2ee`) |
+| `GIT_E2EE_HOME` | Where this device's keys and state live (default `~/.local/share/git-e2ee`; one `accounts/<relay host>/` directory per account) |
 | `E2EE_RELAY_CA_FILE` | Extra CA certificate to trust for a self-hosted relay |
 | `E2EE_MAX_STALENESS_SECS` | Warn after this long without hearing from collaborators (default 7 days) |
 | `E2EE_MAX_PACK_BYTES` | Largest push you'll send or accept, as compressed pack bytes (default 4 GiB). Like plain git, nothing limits how much a pack expands when git unpacks it |
@@ -549,7 +557,7 @@ users to it. You can turn `--invite-only` on later: users who already registered
 device keep working; only new ones need a token. Lists of users who never registered
 a device expire.
 
-**Policy.** `git e2ee register` shows users the relay's policy. By default it's a
+**Policy.** `git e2ee init-user` (and `register`) shows users the relay's policy. By default it's a
 repeat-infringer policy (the operator may ban users who repeatedly infringe others'
 rights) with the address from `--contact abuse@relay.example`; without `--contact` it
 says no contact address is published, and the relay warns at startup. Use

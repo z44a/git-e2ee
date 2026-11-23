@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use e2ee_core::device::Device;
-use e2ee_core::store::{Db, DeviceLock, data_dir};
+use e2ee_core::store::{Db, DeviceLock, account_dir};
 
 /// Locked device state for the duration of one process.
 pub struct Session {
@@ -11,15 +11,38 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn open() -> Result<Self> {
-        let dir = data_dir()?;
-        let lock = DeviceLock::acquire(&dir)?;
-        Ok(Self { db: Db::open(&dir)?, _lock: lock })
+    /// The account on this relay (see `account_dir`): each relay has its own.
+    pub fn open(relay_url: &str) -> Result<Self> {
+        Self::open_dir(&account_dir(relay_url)?)
+    }
+
+    /// The account on this relay, which must exist.
+    pub fn open_existing(relay_url: &str) -> Result<Self> {
+        let dir = account_dir(relay_url)?;
+        if !has_account(&dir) {
+            anyhow::bail!(
+                "you have no git-e2ee account on {} yet: create one with `git e2ee init-user {relay_url}` \
+                 (or, for another device of an existing account, `git e2ee device link {relay_url}`)",
+                e2ee_core::store::relay_host(relay_url)?
+            );
+        }
+        Self::open_dir(&dir)
+    }
+
+    pub fn open_dir(dir: &std::path::Path) -> Result<Self> {
+        let lock = DeviceLock::acquire(dir)?;
+        Ok(Self { db: Db::open(dir)?, _lock: lock })
     }
 
     pub fn device(&self) -> Result<Device> {
         Device::require(&self.db)
     }
+}
+
+/// Does this state directory hold an account (a user, linked or not yet)?
+pub fn has_account(dir: &std::path::Path) -> bool {
+    dir.join("device.sqlite").exists()
+        && Db::open(dir).ok().is_some_and(|db| db.meta_get("master_pub").ok().flatten().is_some())
 }
 
 pub fn runtime() -> Result<tokio::runtime::Runtime> {

@@ -185,11 +185,17 @@ impl Device {
     }
 
     /// Finish linking with the approval code from the master device.
-    pub fn finish_link(db: &Db, code: &str) -> Result<Self> {
-        let approval = identity::decode_approval(code)?;
+    /// `signed`: the user's device list, fetched from the approval's relay.
+    pub fn finish_link(db: &Db, approval: &Approval, signed: &SignedDeviceList) -> Result<Self> {
         let identity = Self::device_identity_or_create(db)?;
-        let signed = approval.device_list.clone().ok_or_else(|| anyhow!("approval has no device list"))?;
-        let (list, _) = identity::verify_device_list(&signed, &approval.master_key, None)?;
+        // The master key comes with the list; it must be the one the user
+        // id names (the relay served the list, and can't forge that).
+        let body = e2ee_proto::DeviceListBody::decode(signed.body.as_slice()).context("malformed device list")?;
+        if user_id_of(&body.master_key).as_slice() != approval.user_id {
+            bail!("the relay served a device list for another user: refusing it");
+        }
+        let master_key = body.master_key.clone();
+        let (list, _) = identity::verify_device_list(signed, &master_key, None)?;
         let mine = identity.identity_key().serialize().to_vec();
         if !list
             .body
@@ -202,23 +208,28 @@ impl Device {
                     && d.kem_key_hash == Self::device_kem_hash(db).unwrap_or_default()
             })
         {
-            bail!("approval does not list this device's key");
+            bail!(
+                "the device list on the relay doesn't include this device yet: run `git e2ee device approve` \
+                 on the master device again (it publishes the list), then finish again"
+            );
         }
-        db.meta_set("master_pub", &approval.master_key)?;
+        db.meta_set("master_pub", &master_key)?;
         db.meta_set_u64("device_id", approval.device_id as u64)?;
         if !approval.delivery_token.is_empty() {
             db.meta_set("delivery_token", &approval.delivery_token)?;
         }
-        let user = user_id_of(&approval.master_key);
-        db.pin(&user, &approval.master_key, true)?;
+        let user = user_id_of(&master_key);
+        db.pin(&user, &master_key, true)?;
         let dev = Self::require(db)?;
-        dev.accept_device_list(&dev.user.clone(), &signed)?;
+        dev.accept_device_list(&dev.user.clone(), signed)?;
         Ok(dev)
     }
 
     /// Master device: approve a link code, producing the new signed list and
     /// the approval code to paste on the new device.
-    pub fn approve_link(&self, link_code: &str) -> Result<(SignedDeviceList, String, u32)> {
+    /// `relay_url`: this account's relay, where the new device fetches the
+    /// list and registers.
+    pub fn approve_link(&self, link_code: &str, relay_url: &str) -> Result<(SignedDeviceList, String, u32)> {
         let master = self.master.as_ref().ok_or_else(|| anyhow!("only the master device can approve devices"))?;
         let (new_key, pq_key_hash, kem_key_hash) = identity::decode_link_code(link_code)?;
         let current = self.own_device_list()?;
@@ -236,10 +247,10 @@ impl Device {
         self.accept_own_signed(&signed)?;
         self.db.meta_set_u64("max_device_id", id as u64)?;
         let code = identity::encode_approval(&Approval {
-            master_key: self.master_pub.clone(),
+            user_id: self.user.clone(),
             device_id: id,
-            device_list: Some(signed.clone()),
             delivery_token: self.delivery_token()?,
+            relay_url: relay_url.to_string(),
         });
         Ok((signed, code, id))
     }
@@ -704,9 +715,19 @@ mod tests {
         let master = Device::create_user(&master_db).unwrap();
         let new_db = Db::open_in_memory().unwrap();
         let link = Device::begin_link(&new_db).unwrap();
-        let (_, approval, id) = master.approve_link(&link).unwrap();
+        let (signed, code, id) = master.approve_link(&link, "https://relay.test").unwrap();
         assert_eq!(id, 2);
-        let laptop = Device::finish_link(&new_db, &approval).unwrap();
+        // Short: the device list (with its ML-DSA signature) isn't in it.
+        assert!(code.len() < 200, "approval code is {} characters", code.len());
+        let approval = identity::decode_approval(&code).unwrap();
+        assert_eq!(approval.relay_url, "https://relay.test");
+        // A list for another user (what a relay could serve instead) is refused.
+        let other = Device::create_user(&Db::open_in_memory().unwrap()).unwrap();
+        let other_list = other.own_device_list().unwrap();
+        let other_signed = SignedDeviceList::decode(other.db.signed_device_list(&other.user).unwrap().unwrap().as_slice()).unwrap();
+        let _ = other_list;
+        assert!(Device::finish_link(&new_db, &approval, &other_signed).is_err());
+        let laptop = Device::finish_link(&new_db, &approval, &signed).unwrap();
         assert_eq!(laptop.user, master.user);
         assert!(laptop.master.is_none());
         assert_eq!(laptop.own_device_list().unwrap().devices().len(), 2);
@@ -717,7 +738,7 @@ mod tests {
         assert!(laptop.db.device_key(&laptop.user, 2).unwrap().is_none());
         // Re-linking the revoked key gets a fresh id, never reusing 2.
         let link2 = Device::begin_link(&Db::open_in_memory().unwrap()).unwrap();
-        let (_, _, id2) = master.approve_link(&link2).unwrap();
+        let (_, _, id2) = master.approve_link(&link2, "https://relay.test").unwrap();
         assert_eq!(id2, 3);
     }
 

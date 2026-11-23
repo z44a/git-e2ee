@@ -120,7 +120,7 @@ impl Engine {
         let rid = hex::encode(&repo_id);
         // Created on first use (see `mirror()`), so read-only commands like
         // `status` leave no trace.
-        let mirror = Git::new(crate::store::data_dir()?.join("mirrors").join(format!("{rid}.git")));
+        let mirror = Git::new(crate::store::account_dir(&relay_url)?.join("mirrors").join(format!("{rid}.git")));
         Ok(Self {
             relay: RelayClient::new(&relay_url)?,
             mirror,
@@ -314,8 +314,17 @@ impl Engine {
     /// Publish our device list and prekeys to this relay, topping up
     /// one-time prekeys when they run low.
     pub async fn ensure_registered(&mut self) -> Result<()> {
-        if let Some(own) = self.dev.db.signed_device_list(&self.dev.user)? {
-            self.relay.put_device_list_with_token(&hex::encode(&self.dev.user), &own, self.registration_token.as_deref()).await?;
+        // Upload our list; if the relay has a newer one (the master device
+        // added or revoked a device), take it: so every device of ours learns
+        // of the change on its next sync, not only from messages of the
+        // device that made it. (The upload already tells the relay we're
+        // active, so the fetch reveals nothing more.)
+        if let Some(own) = self.dev.db.signed_device_list(&self.dev.user)?
+            && self.relay.put_device_list_with_token(&hex::encode(&self.dev.user), &own, self.registration_token.as_deref()).await?
+            && let Some(bytes) = self.relay.get_device_list(&hex::encode(&self.dev.user)).await?
+            && let Ok(signed) = SignedDeviceList::decode(bytes.as_slice())
+        {
+            let _ = self.dev.accept_device_list(&self.dev.user.clone(), &signed);
         }
         self.dev.rotate_prekeys_if_due().await?;
         let spk = self.dev.signed_prekey_id()?;

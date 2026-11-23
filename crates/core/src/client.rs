@@ -228,12 +228,13 @@ impl RelayClient {
     // -- devices -------------------------------------------------------------
 
     pub async fn put_device_list(&self, user_hex: &str, signed: &[u8]) -> Result<()> {
-        self.put_device_list_with_token(user_hex, signed, None).await
+        self.put_device_list_with_token(user_hex, signed, None).await.map(|_| ())
     }
 
     /// `registration_token`: needed on invite-only relays until the user's
     /// first device has registered.
-    pub async fn put_device_list_with_token(&self, user_hex: &str, signed: &[u8], registration_token: Option<&str>) -> Result<()> {
+    /// Ok(true): the relay already has a newer list (it keeps that one).
+    pub async fn put_device_list_with_token(&self, user_hex: &str, signed: &[u8], registration_token: Option<&str>) -> Result<bool> {
         let mut req = self.anon.put(format!("{}/users/{user_hex}/device-list", self.base));
         if let Some(t) = registration_token {
             req = req.header(headers::REGISTRATION_TOKEN, t);
@@ -243,11 +244,10 @@ impl RelayClient {
             .send_retry()
             .await?;
         if resp.status() == StatusCode::CONFLICT {
-            // Relay already has a newer list; clients sort it out.
-            return Ok(());
+            return Ok(true);
         }
         Self::check(resp, "device list upload").await?;
-        Ok(())
+        Ok(false)
     }
 
     /// The relay operator's policy text (`GET /policy`), cleaned for showing

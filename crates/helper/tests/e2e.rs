@@ -16,15 +16,25 @@ struct TestRelay {
 }
 
 fn start_relay_with(limits: e2ee_relay::Limits) -> TestRelay {
+    start_relay_named(limits, None)
+}
+
+/// A relay clients reach as `http://<host>:<port>` (its public URL).
+fn start_relay_named(limits: e2ee_relay::Limits, host: Option<&str>) -> TestRelay {
+    let host = host.map(str::to_string);
     let relay = Relay::open_in_memory_with(limits).unwrap();
     relay.enable_test_instrumentation();
     let (tx, rx) = std::sync::mpsc::channel();
     let r = relay.clone();
+    let public_host = host.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
             let l0 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let l1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            if let Some(h) = &public_host {
+                r.set_public_url(&format!("http://{h}:{}", l0.local_addr().unwrap().port())).unwrap();
+            }
             tx.send((l0.local_addr().unwrap(), l1.local_addr().unwrap())).unwrap();
             let a = tokio::spawn(e2ee_relay::serve(l0, r.clone(), 0));
             let b = tokio::spawn(e2ee_relay::serve(l1, r, 1));
@@ -32,7 +42,11 @@ fn start_relay_with(limits: e2ee_relay::Limits) -> TestRelay {
         });
     });
     let (a, b) = rx.recv().unwrap();
-    TestRelay { relay, url: format!("http://{a}"), url_fork: format!("http://{b}") }
+    let url = match &host {
+        Some(h) => format!("http://{h}:{}", a.port()),
+        None => format!("http://{a}"),
+    };
+    TestRelay { relay, url, url_fork: format!("http://{b}") }
 }
 
 impl TestRelay {
@@ -105,15 +119,20 @@ impl Dev {
     }
 
     fn init_user(&self, relay: &str) -> String {
-        let out = self.e2ee(&self.root, &["init-user"]);
-        self.e2ee(&self.root, &["register", relay]);
+        let out = self.e2ee(&self.root, &["init-user", relay]);
         code_from(&out, "e2eeu1:")
+    }
+
+    /// This device's account state on the test relay (accounts are per
+    /// relay host; every test relay listens on 127.0.0.1).
+    fn acct(&self) -> PathBuf {
+        self.home.join("accounts").join("127.0.0.1")
     }
 
     /// Every mailbox this device reads on the relay: the one named by its
     /// user id and device, and its pseudonymous per-repo ones (device 0).
     fn mailboxes(&self) -> Vec<(String, u32)> {
-        let db = rusqlite::Connection::open(self.home.join("device.sqlite")).unwrap();
+        let db = rusqlite::Connection::open(self.acct().join("device.sqlite")).unwrap();
         let dev: Vec<u8> = db.query_row("SELECT v FROM meta WHERE k = 'device_id'", [], |r| r.get(0)).unwrap();
         let mut out = vec![(self.user_hex(), u64::from_be_bytes(dev.try_into().unwrap()) as u32)];
         let mut st = db.prepare("SELECT mailbox FROM own_mailboxes").unwrap();
@@ -241,10 +260,9 @@ fn stale_push_is_rejected() {
 fn linked_device_receives_history_and_can_push() {
     let w = world();
     let laptop = Dev::new(&w.root, "alice-laptop");
-    let link = code_from(&laptop.e2ee(&w.root, &["device", "link"]), "e2eed1:");
-    let approval = code_from(&w.alice.e2ee(&w.root, &["device", "approve", &link]), "e2eea1:");
+    let link = code_from(&laptop.e2ee(&w.root, &["device", "link", &w.relay.url]), "e2eed1:");
+    let approval = code_from(&w.alice.e2ee(&w.root, &["device", "approve", &link]), "e2eea2:");
     laptop.e2ee(&w.root, &["device", "finish", &approval]);
-    laptop.e2ee(&w.root, &["register", &w.relay.url]);
     w.alice.e2ee(&w.arepo, &["send-history"]);
 
     let lrepo = w.root.join("lrepo");
@@ -699,10 +717,10 @@ fn invite_only_relay_end_to_end() {
     std::fs::write(root.join("gitconfig"), "[user]\n\tname = A\n\temail = a@example.invalid\n").unwrap();
     let relay = start_relay_with(e2ee_relay::Limits { invite_only: true, ..Default::default() });
     let alice = Dev::new(&root, "alice");
-    alice.e2ee(&root, &["init-user"]);
-    let out = alice.run("git-e2ee", &root, &["register", &relay.url]);
+    // The account is created, but registering needs a token.
+    let out = alice.run("git-e2ee", &root, &["init-user", &relay.url]);
     assert!(!out.status.success());
-    assert!(stderr(&out).contains("invite-only"), "{}", stderr(&out));
+    assert!(stderr(&out).contains("invite-only") && stderr(&out).contains("--token"), "{}", stderr(&out));
     let token = relay.relay.issue_registration_token(std::time::Duration::from_secs(3600)).unwrap();
     alice.e2ee(&root, &["register", &relay.url, "--token", &token]);
     let repo = root.join("r");
@@ -715,10 +733,9 @@ fn invite_only_relay_end_to_end() {
 /// Link a second device for `owner` and give it a clone of `url`.
 fn link_device(w: &World, owner: &Dev, owner_repo: &Path, name: &str) -> (Dev, PathBuf) {
     let laptop = Dev::new(&w.root, name);
-    let link = code_from(&laptop.e2ee(&w.root, &["device", "link"]), "e2eed1:");
-    let approval = code_from(&owner.e2ee(&w.root, &["device", "approve", &link]), "e2eea1:");
+    let link = code_from(&laptop.e2ee(&w.root, &["device", "link", &w.relay.url]), "e2eed1:");
+    let approval = code_from(&owner.e2ee(&w.root, &["device", "approve", &link]), "e2eea2:");
     laptop.e2ee(&w.root, &["device", "finish", &approval]);
-    laptop.e2ee(&w.root, &["register", &w.relay.url]);
     owner.e2ee(owner_repo, &["send-history"]);
     let repo = w.root.join(format!("{name}-repo"));
     laptop.git(&w.root, &["clone", "-q", &w.url, repo.to_str().unwrap()]);
@@ -753,8 +770,11 @@ fn hidden_revocation_reaches_peers_in_band() {
 #[test]
 fn hidden_new_device_introduces_itself() {
     let w = world();
-    w.relay.relay.freeze_device_lists();
+    // The relay serves the laptop its list (it couldn't link otherwise), but
+    // keeps serving everyone the list without it.
+    let old = w.relay.relay.device_lists_snapshot();
     let (laptop, lrepo) = link_device(&w, &w.bob, &w.brepo, "bob-laptop");
+    w.relay.relay.serve_device_lists(old);
     let c = commit(&laptop, &lrepo, "laptop.txt", "from laptop\n", "laptop");
     laptop.git(&lrepo, &["push", "-q"]);
     pq_settle(&w.alice, &w.arepo, &laptop, &lrepo);
@@ -862,7 +882,7 @@ fn newcomer_gets_device_lists_from_the_history_bundle() {
 
 /// Rows in a device's local inbox for repos it has no state for.
 fn orphan_inbox_rows(dev: &Dev) -> i64 {
-    let db = rusqlite::Connection::open(dev.home.join("device.sqlite")).unwrap();
+    let db = rusqlite::Connection::open(dev.acct().join("device.sqlite")).unwrap();
     db.query_row("SELECT COUNT(*) FROM inbox WHERE repo_id NOT IN (SELECT repo_id FROM repos)", [], |r| r.get(0))
         .unwrap()
 }
@@ -1017,11 +1037,14 @@ fn bad_history_bundle_is_discarded_not_blocking() {
 #[test]
 fn unreachable_device_is_backed_off_reported_and_expired() {
     let w = world();
-    // Bob links a laptop but never runs `register` on it.
+    // Bob links a laptop whose registration the relay loses.
     let laptop = Dev::new(&w.root, "bob-laptop");
-    let link = code_from(&laptop.e2ee(&w.root, &["device", "link"]), "e2eed1:");
-    let approval = code_from(&w.bob.e2ee(&w.root, &["device", "approve", &link]), "e2eea1:");
-    laptop.e2ee(&w.root, &["device", "finish", &approval]);
+    let link = code_from(&laptop.e2ee(&w.root, &["device", "link", &w.relay.url]), "e2eed1:");
+    let approval = code_from(&w.bob.e2ee(&w.root, &["device", "approve", &link]), "e2eea2:");
+    let out = laptop.e2ee(&w.root, &["device", "finish", &approval]);
+    let bob_hex = w.bob.e2ee(&w.root, &["whoami"]).lines().find_map(|l| l.strip_prefix("user id:").map(|x| x.trim().to_string())).unwrap();
+    assert!(out.contains("Linked as device 2"), "{out}");
+    w.relay.relay.drop_device_keys(&bob_hex, 2);
     w.bob.with_env("E2EE_GOSSIP_SECS", "0").e2ee(&w.brepo, &["sync"]); // tells Alice about the laptop (in-band)
 
     let misses = || w.relay.relay.bundle_misses.load(std::sync::atomic::Ordering::Relaxed);
@@ -1168,7 +1191,7 @@ fn forgetting_a_repo_removes_local_state_and_ignores_its_mail() {
     w.bob.e2ee(&w.brepo, &["repo", "forget", "--yes"]);
     assert!(w.bob.status(&w.brepo).contains("no state for this repo"));
     let rid = w.url.rsplit('/').next().unwrap();
-    assert!(!w.bob.home.join("mirrors").join(format!("{rid}.git")).exists());
+    assert!(!w.bob.acct().join("mirrors").join(format!("{rid}.git")).exists());
     commit(&w.alice, &w.arepo, "after.txt", "x\n", "x");
     w.alice.git(&w.arepo, &["push", "-q"]);
     // Syncing the other repo drains Bob's mailbox; the forgotten repo's mail
@@ -1573,7 +1596,7 @@ fn mailbox_rotation_loses_nothing() {
     w.bob.e2ee(&w.brepo, &["sync"]);
     w.alice.e2ee(&w.arepo, &["sync"]);
     w.bob.with_env("E2EE_MAILBOX_ROTATE_SECS", "0").e2ee(&w.brepo, &["sync"]);
-    let db = rusqlite::Connection::open(w.bob.home.join("device.sqlite")).unwrap();
+    let db = rusqlite::Connection::open(w.bob.acct().join("device.sqlite")).unwrap();
     let n: i64 = db.query_row("SELECT COUNT(*) FROM own_mailboxes", [], |r| r.get(0)).unwrap();
     assert!(n >= 2, "no rotation happened");
     let c = commit(&w.alice, &w.arepo, "r.txt", "r\n", "after rotation");
@@ -1584,9 +1607,63 @@ fn mailbox_rotation_loses_nothing() {
         .query_row("SELECT mailbox FROM own_mailboxes WHERE retired_ms IS NULL", [], |r| r.get(0))
         .unwrap();
     w.alice.e2ee(&w.arepo, &["sync"]); // hears Bob's new address from his ack
-    let adb = rusqlite::Connection::open(w.alice.home.join("device.sqlite")).unwrap();
+    let adb = rusqlite::Connection::open(w.alice.acct().join("device.sqlite")).unwrap();
     let known: Vec<u8> = adb.query_row("SELECT mailbox FROM peer_mailboxes WHERE device_id = 1", [], |r| r.get(0)).unwrap();
     assert_eq!(known, current, "Alice didn't learn Bob's new mailbox");
+}
+
+/// Accounts are per relay: Alice's account on a second relay is another
+/// user, picked by the repo's remote or `--relay`, and listed by `accounts`.
+#[test]
+fn each_relay_has_its_own_account() {
+    let w = world();
+    // Another host name for the second relay (the account key is the host).
+    let other = start_relay_named(Default::default(), Some("localhost"));
+    let other_url = other.url.clone();
+    let out = w.alice.e2ee(&w.root, &["init-user", &other_url]);
+    let code2 = code_from(&out, "e2eeu1:");
+    let code1 = code_from(&w.alice.e2ee(&w.arepo, &["whoami"]), "e2eeu1:");
+    assert_ne!(code1, code2, "a new relay gets a new user");
+    // Again on the same relay: refused, there's one account per relay.
+    let again = w.alice.run("git-e2ee", &w.root, &["init-user", &other_url]);
+    assert!(!again.status.success() && stderr(&again).contains("already have an account"), "{}", stderr(&again));
+
+    let accts = w.alice.e2ee(&w.root, &["accounts"]);
+    assert!(accts.contains("127.0.0.1") && accts.contains("localhost"), "{accts}");
+    // Outside a repo, with two accounts: which one must be said.
+    let amb = w.alice.run("git-e2ee", &w.root, &["whoami"]);
+    assert!(!amb.status.success() && stderr(&amb).contains("--relay"), "{}", stderr(&amb));
+    let picked = w.alice.e2ee(&w.root, &["--relay", &other_url, "whoami"]);
+    assert!(picked.contains(&code2), "{picked}");
+
+    // A repo on the second relay uses the second account.
+    let repo = w.root.join("second");
+    w.alice.git(&w.root, &["init", "-q", "--object-format=sha256", repo.to_str().unwrap()]);
+    commit(&w.alice, &repo, "s", "s\n", "s");
+    w.alice.e2ee(&repo, &["repo", "init", &other_url]);
+    w.alice.git(&repo, &["push", "-q", "-u", "origin", "main"]);
+    assert!(w.alice.e2ee(&repo, &["whoami"]).contains(&code2));
+    let members = w.alice.e2ee(&repo, &["member", "list"]);
+    assert_eq!(members.lines().filter(|l| l.contains("(you)")).count(), 1, "{members}");
+    // ... and its state lives in that account's directory.
+    assert!(w.alice.home.join("accounts").join("localhost").join("device.sqlite").exists());
+}
+
+/// A linked device learns of a device added by the master from the relay on
+/// its next sync, without waiting for a message from the master.
+#[test]
+fn linked_devices_pick_up_device_list_changes_on_sync() {
+    let w = world();
+    let (laptop, lrepo) = link_device(&w, &w.bob, &w.brepo, "bob-laptop");
+    let phone = Dev::new(&w.root, "bob-phone");
+    let link = code_from(&phone.e2ee(&w.root, &["device", "link", &w.relay.url]), "e2eed1:");
+    let approval = code_from(&w.bob.e2ee(&w.root, &["device", "approve", &link]), "e2eea2:");
+    phone.e2ee(&w.root, &["device", "finish", &approval]);
+    laptop.e2ee(&lrepo, &["sync"]);
+    let list = laptop.e2ee(&lrepo, &["device", "list"]);
+    assert!(list.contains("device list version 3") && list.lines().filter(|l| l.starts_with("  ")).count() == 3, "{list}");
+    // And the approval code is short (the list isn't in it).
+    assert!(approval.len() < 200, "{}", approval.len());
 }
 
 /// Registering shows the relay's policy.
@@ -1594,8 +1671,7 @@ fn mailbox_rotation_loses_nothing() {
 fn register_prints_the_relay_policy() {
     let w = world();
     let dana = Dev::new(&w.root, "dana");
-    dana.e2ee(&w.root, &["init-user"]);
-    let out = dana.e2ee(&w.root, &["register", &w.relay.url]);
+    let out = dana.e2ee(&w.root, &["init-user", &w.relay.url]);
     assert!(out.contains("Policy of") && out.contains("Repeat infringers"), "{out}");
 }
 
@@ -1646,7 +1722,7 @@ fn catch_up_refuses_a_bundle_off_our_chain() {
     let bob = w.bob.with_env("E2EE_HISTORY_AFTER_SECS", "0").with_env("E2EE_RESEND_SECS", "0");
     bob.ok("git", &w.brepo, &["fetch"]); // stuck; asks for history
     let before = w.bob.git(&w.brepo, &["rev-parse", "HEAD"]);
-    rusqlite::Connection::open(w.bob.home.join("device.sqlite"))
+    rusqlite::Connection::open(w.bob.acct().join("device.sqlite"))
         .unwrap()
         .execute("UPDATE repos SET head = randomblob(32)", [])
         .unwrap();
@@ -1747,7 +1823,7 @@ fn a_claim_that_never_delivers_only_delays_catch_up() {
 fn coming_back_after_weeks_explains_itself_and_says_what_to_do() {
     let w = world();
     let c = strand_bob(&w, &[]);
-    let db = rusqlite::Connection::open(w.bob.home.join("device.sqlite")).unwrap();
+    let db = rusqlite::Connection::open(w.bob.acct().join("device.sqlite")).unwrap();
     let three_weeks_ago = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
         - 21 * 24 * 3600 * 1000;
     db.execute("UPDATE meta SET v = ?1 WHERE k LIKE 'last-sync:%'", [three_weeks_ago.to_be_bytes().to_vec()]).unwrap();
@@ -1824,7 +1900,7 @@ fn require_pseudonym_needs_a_pseudonym_and_keys_are_owner_only() {
     let out = w.alice.run("git", &w.arepo, &["push", "-q"]);
     assert!(!out.status.success() && stderr(&out).contains("e2ee.pseudonym isn't"), "{}", stderr(&out));
     use std::os::unix::fs::PermissionsExt;
-    let mode = std::fs::metadata(w.alice.home.join("device.sqlite")).unwrap().permissions().mode();
+    let mode = std::fs::metadata(w.alice.acct().join("device.sqlite")).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o600, "device.sqlite mode {mode:o}");
 }
 
@@ -2060,7 +2136,7 @@ fn log_entries_disappear_on_the_timer_they_were_recorded_under() {
         assert!(log.contains("new entries are deleted 3 seconds after"), "{log}");
     }
     // Deleted, not hidden.
-    let db = rusqlite::Connection::open(w.bob.home.join("device.sqlite")).unwrap();
+    let db = rusqlite::Connection::open(w.bob.acct().join("device.sqlite")).unwrap();
     let mut st = db.prepare("SELECT entry FROM push_log").unwrap();
     let rows: Vec<Vec<u8>> = st.query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect();
     assert!(!rows.iter().any(|r| r.windows(12).any(|x| x == &p2.as_bytes()[..12])), "the expired entry is still stored");

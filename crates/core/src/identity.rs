@@ -306,7 +306,7 @@ pub fn format_safety_number(s: &str) -> String {
 
 const USER_CODE: &str = "e2eeu1:";
 const LINK_CODE: &str = "e2eed1:";
-const APPROVAL_CODE: &str = "e2eea1:";
+const APPROVAL_CODE: &str = "e2eea2:";
 
 pub fn encode_user_code(master_key: &[u8]) -> String {
     format!("{USER_CODE}{}", B64.encode(master_key))
@@ -347,16 +347,21 @@ pub fn decode_link_code(code: &str) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
 
 /// Handed from the master device to a newly linked device.
 #[derive(Clone, PartialEq, prost::Message)]
+/// What `device approve` hands the new device: short, because the signed
+/// device list (with its ML-DSA signature, ~10 KB) isn't in it. The new
+/// device fetches that from the relay and accepts it only if its master key
+/// hashes to `user_id`, which a relay can't arrange for a key of its own.
 pub struct Approval {
     #[prost(bytes = "vec", tag = "1")]
-    pub master_key: Vec<u8>,
+    pub user_id: Vec<u8>,
     #[prost(uint32, tag = "2")]
     pub device_id: u32,
-    #[prost(message, optional, tag = "3")]
-    pub device_list: Option<SignedDeviceList>,
     /// The user's delivery token, shared by all its devices.
-    #[prost(bytes = "vec", tag = "4")]
+    #[prost(bytes = "vec", tag = "3")]
     pub delivery_token: Vec<u8>,
+    /// The relay of this account (accounts are per relay).
+    #[prost(string, tag = "4")]
+    pub relay_url: String,
 }
 
 pub fn encode_approval(a: &Approval) -> String {

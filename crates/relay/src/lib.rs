@@ -590,10 +590,29 @@ impl Relay {
 
     /// Adversary: freeze every currently stored device list.
     pub fn freeze_device_lists(&self) {
+        let rows = self.device_lists_snapshot();
+        self.serve_device_lists(rows);
+    }
+
+    /// Every currently stored device list (for `serve_device_lists`).
+    pub fn device_lists_snapshot(&self) -> HashMap<String, Vec<u8>> {
         let db = self.db.lock().unwrap();
         let mut st = db.prepare("SELECT user, signed FROM device_lists").unwrap();
-        let rows: Vec<(String, Vec<u8>)> = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(Result::unwrap).collect();
-        self.adversary.lock().unwrap().frozen_device_lists = rows.into_iter().collect();
+        st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(Result::unwrap).collect()
+    }
+
+    /// Adversary: from now on serve these (older) lists instead of the
+    /// stored ones, and don't act on uploads.
+    pub fn serve_device_lists(&self, lists: HashMap<String, Vec<u8>>) {
+        self.adversary.lock().unwrap().frozen_device_lists = lists;
+    }
+
+    /// Test hook: forget a device's keys, as if it had never registered.
+    pub fn drop_device_keys(&self, user_hex: &str, device: u32) {
+        let db = self.db.lock().unwrap();
+        for t in ["device_keys", "one_time", "one_time_kyber"] {
+            db.execute(&format!("DELETE FROM {t} WHERE user = ?1 AND device = ?2"), params![user_hex, device]).unwrap();
+        }
     }
 
     /// Ban a user: drop their device registrations and prekeys, refuse them

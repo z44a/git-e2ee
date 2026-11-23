@@ -9,21 +9,35 @@ use e2ee_core::device::{Device, short};
 use e2ee_core::engine::Engine;
 use e2ee_core::git::Git;
 use e2ee_core::identity::{decode_user_code, encode_user_code, format_safety_number, safety_number};
-use e2ee_helper::{Session, print_report, print_warnings, runtime, printable};
+use e2ee_helper::{Session, has_account, print_report, print_warnings, runtime, printable};
+use e2ee_core::store::{account_dir, accounts, relay_host};
 use e2ee_proto::{Member, Message, user_id_of};
 
 #[derive(Parser)]
 #[command(name = "git-e2ee", bin_name = "git e2ee", about = "End-to-end encrypted, deniable git remotes")]
 struct Cli {
+    /// The relay whose account to use (accounts are per relay). Default: the
+    /// current repo's relay, or your only account.
+    #[arg(long, global = true)]
+    relay: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Create a new user (master key) with this device as device 1.
-    InitUser,
-    /// Show this user's code and id.
+    /// Create your account on a relay (a user with its own master key, this
+    /// device as device 1) and register it. Accounts on different relays are
+    /// separate users.
+    InitUser {
+        relay_url: String,
+        /// Registration token from the relay operator (invite-only relays).
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// List your accounts (one per relay).
+    Accounts,
+    /// Show this account's code and id.
     Whoami,
     /// Compare safety numbers with another user and pin their master key.
     Verify {
@@ -43,7 +57,9 @@ enum Cmd {
         user: String,
         name: String,
     },
-    /// Publish this device's keys and device list to a relay.
+    /// Register this account's device with its relay again (say, with a
+    /// token after the relay became invite-only). `init-user` and
+    /// `device finish` register already.
     Register {
         relay_url: String,
         /// Registration token from the relay operator (invite-only relays;
@@ -110,8 +126,9 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum DeviceCmd {
-    /// On a new device: print a link code to paste on the master device.
-    Link,
+    /// On a new device: start joining your account on this relay; prints a
+    /// link code to paste on the master device.
+    Link { relay_url: String },
     /// On the master device: approve a link code.
     Approve { link_code: String },
     /// On the new device: finish linking with the approval code.
@@ -219,16 +236,23 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<()> {
-    let session = Session::open()?;
     let rt = runtime()?;
+    // Commands that create an account's state, or span accounts.
+    match &cli.cmd {
+        Cmd::InitUser { relay_url, token } => return init_user(&rt, relay_url, token.clone()),
+        Cmd::Accounts => return list_accounts(),
+        Cmd::Device(DeviceCmd::Link { relay_url }) => return begin_link(relay_url),
+        Cmd::Device(DeviceCmd::Finish { approval_code }) => return finish_link(&rt, approval_code),
+        _ => {}
+    }
+    let (session, account_relay) = open_account(&cli)?;
     match cli.cmd {
-        Cmd::InitUser => {
-            let dev = Device::create_user(&session.db)?;
-            println!("Created user {}", hex::encode(&dev.user));
-            println!("Your user code (share it with collaborators):\n  {}", encode_user_code(&dev.master_pub));
-        }
+        Cmd::InitUser { .. } | Cmd::Accounts => unreachable!(),
         Cmd::Whoami => {
             let dev = session.device()?;
+            if let Some(r) = &account_relay {
+                println!("relay:     {}", relay_host(r)?);
+            }
             println!("user id:   {}", hex::encode(&dev.user));
             println!("device id: {}{}", dev.device_id, if dev.master.is_some() { " (master)" } else { "" });
             println!("user code: {}", encode_user_code(&dev.master_pub));
@@ -274,25 +298,8 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Cmd::Register { relay_url, token } => {
-            let dev = session.device()?;
-            // Registration is per relay; any repo id works for the URL shape.
-            let policy = e2ee_core::client::RelayClient::new(&relay_url).and_then(|c| rt.block_on(c.policy()));
-            match policy {
-                Ok(p) => println!("Policy of {relay_url}:\n\n{}\n", e2ee_core::printable_text(p.trim_end())),
-                Err(e) => eprintln!("note: could not fetch the relay's policy: {}", printable(&format!("{e:#}"))),
-            }
-            let mut eng = Engine::new(dev, &format!("{}/{}", relay_url.trim_end_matches('/'), "0".repeat(32)))?;
-            eng.registration_token = token;
-            rt.block_on(eng.ensure_registered())?;
-            println!("Registered device with {relay_url}");
-            // Handshake with our other devices right away (see `verify`).
-            let me = session.device()?.user;
-            if let Err(e) = rt.block_on(eng.pq_introduce(&me)) {
-                eprintln!("note: could not start handshakes with your other devices: {}", printable(&format!("{e:#}")));
-            }
-        }
-        Cmd::Device(d) => device_cmd(&session, &rt, d)?,
+        Cmd::Register { relay_url, token } => register(&session, &rt, &relay_url, token)?,
+        Cmd::Device(d) => device_cmd(&session, &rt, d, account_relay.as_deref())?,
         Cmd::Repo(RepoCmd::Init { relay_url, remote, allow_sha1 }) => {
             let git = Git::discover()?;
             let format = git.object_format()?;
@@ -574,22 +581,154 @@ fn sync(rt: &tokio::runtime::Runtime, eng: &mut Engine) -> Result<e2ee_core::eng
     Ok(r)
 }
 
-fn device_cmd(session: &Session, rt: &tokio::runtime::Runtime, cmd: DeviceCmd) -> Result<()> {
-    match cmd {
-        DeviceCmd::Link => {
-            let code = Device::begin_link(&session.db)?;
-            println!("Run this on your master device:\n  git e2ee device approve {code}");
+/// Which account a command uses, opened: the relay a command names, else
+/// `--relay`, else the current repo's relay, else your only account. Also
+/// returns that relay's URL, when it's known.
+fn open_account(cli: &Cli) -> Result<(Session, Option<String>)> {
+    let named: Option<String> = match &cli.cmd {
+        Cmd::Register { relay_url, .. } | Cmd::Repo(RepoCmd::Init { relay_url, .. }) => Some(relay_url.clone()),
+        Cmd::SendHistory { remote, .. }
+        | Cmd::Sync { remote }
+        | Cmd::Log { remote, .. }
+        | Cmd::LogTimer { remote, .. }
+        | Cmd::Status { remote }
+        | Cmd::ClearConflict { remote }
+        | Cmd::Repo(RepoCmd::Leave { remote, .. })
+        | Cmd::Repo(RepoCmd::Forget { remote, .. })
+        | Cmd::Member(MemberCmd::Add { remote, .. })
+        | Cmd::Member(MemberCmd::Remove { remote, .. })
+        | Cmd::Member(MemberCmd::List { remote }) => Some(e2ee_core::engine::parse_url(&remote.url()?)?.0),
+        _ => None,
+    };
+    if let Some(r) = named.or_else(|| cli.relay.clone()) {
+        return Ok((Session::open_existing(&r)?, Some(r)));
+    }
+    // In a repo with an e2ee remote: its relay.
+    if let Ok(u) = (RemoteArg { remote: "origin".into(), url: None }).url()
+        && let Ok((r, _)) = e2ee_core::engine::parse_url(&u)
+    {
+        return Ok((Session::open_existing(&r)?, Some(r)));
+    }
+    match accounts()?.as_slice() {
+        [] => bail!("you have no git-e2ee account yet: create one with `git e2ee init-user <relay-url>`"),
+        [(_, dir)] => {
+            let s = Session::open_dir(dir)?;
+            let relay = s.db.relays()?.into_iter().next();
+            Ok((s, relay))
         }
+        many => bail!(
+            "you have accounts on several relays ({}): pick one with `--relay <url>`",
+            many.iter().map(|(h, _)| h.as_str()).collect::<Vec<_>>().join(", ")
+        ),
+    }
+}
+
+/// `git e2ee init-user <relay>`: a new account on that relay, registered.
+fn init_user(rt: &tokio::runtime::Runtime, relay_url: &str, token: Option<String>) -> Result<()> {
+    let dir = account_dir(relay_url)?;
+    if has_account(&dir) {
+        let s = Session::open_dir(&dir)?;
+        bail!(
+            "you already have an account on {} (user {}); accounts are one per relay",
+            relay_host(relay_url)?,
+            short(&s.device()?.user)
+        );
+    }
+    let session = Session::open_dir(&dir)?;
+    let dev = Device::create_user(&session.db)?;
+    println!("Created your account on {}: user {}", relay_host(relay_url)?, hex::encode(&dev.user));
+    println!("Your user code (share it with collaborators):\n  {}", encode_user_code(&dev.master_pub));
+    if let Err(e) = register(&session, rt, relay_url, token) {
+        bail!(
+            "{e:#}\nThe account is created; register it when you can: `git e2ee register {relay_url}` \
+             (with `--token <token>` on an invite-only relay)"
+        );
+    }
+    Ok(())
+}
+
+/// Show the relay's policy and register this account's device with it.
+fn register(session: &Session, rt: &tokio::runtime::Runtime, relay_url: &str, token: Option<String>) -> Result<()> {
+    let dev = session.device()?;
+    let policy = e2ee_core::client::RelayClient::new(relay_url).and_then(|c| rt.block_on(c.policy()));
+    match policy {
+        Ok(p) => println!("Policy of {relay_url}:\n\n{}\n", e2ee_core::printable_text(p.trim_end())),
+        Err(e) => eprintln!("note: could not fetch the relay's policy: {}", printable(&format!("{e:#}"))),
+    }
+    // Registration is per relay; any repo id works for the URL shape.
+    let mut eng = Engine::new(dev, &format!("{}/{}", relay_url.trim_end_matches('/'), "0".repeat(32)))?;
+    eng.registration_token = token;
+    rt.block_on(eng.ensure_registered())?;
+    println!("Registered device with {relay_url}");
+    // Handshake with our other devices right away (see `verify`).
+    let me = session.device()?.user;
+    if let Err(e) = rt.block_on(eng.pq_introduce(&me)) {
+        eprintln!("note: could not start handshakes with your other devices: {}", printable(&format!("{e:#}")));
+    }
+    Ok(())
+}
+
+/// `git e2ee accounts`
+fn list_accounts() -> Result<()> {
+    let all = accounts()?;
+    if all.is_empty() {
+        println!("no accounts yet: create one with `git e2ee init-user <relay-url>`");
+    }
+    for (host, dir) in all {
+        let s = Session::open_dir(&dir)?;
+        match s.device() {
+            Ok(d) => println!("{host}  user {}  device {}{}", short(&d.user), d.device_id, if d.master.is_some() { " (master)" } else { "" }),
+            Err(_) => println!("{host}  (device not linked yet: finish with `git e2ee device finish`)"),
+        }
+    }
+    Ok(())
+}
+
+/// `git e2ee device link <relay>`: this device's keys for joining your
+/// account on that relay.
+fn begin_link(relay_url: &str) -> Result<()> {
+    let dir = account_dir(relay_url)?;
+    if has_account(&dir) {
+        bail!("this device already has an account on {}", relay_host(relay_url)?);
+    }
+    let session = Session::open_dir(&dir)?;
+    let code = Device::begin_link(&session.db)?;
+    println!(
+        "Run this on your master device (add `--relay {relay_url}` there if it has accounts on several relays):\n  \
+         git e2ee device approve {code}"
+    );
+    Ok(())
+}
+
+/// `git e2ee device finish <code>`: fetch the account's device list from
+/// its relay (checked against the user id in the code), then register.
+fn finish_link(rt: &tokio::runtime::Runtime, code: &str) -> Result<()> {
+    let approval = e2ee_core::identity::decode_approval(code)?;
+    let relay_url = approval.relay_url.clone();
+    let session = Session::open_dir(&account_dir(&relay_url)?)?;
+    let bytes = rt
+        .block_on(RelayClient::new(&relay_url)?.get_device_list(&hex::encode(&approval.user_id)))?
+        .ok_or_else(|| anyhow!("{relay_url} has no device list for that user: run `git e2ee device approve` on the master device again (it publishes it)"))?;
+    let signed = e2ee_proto::SignedDeviceList::decode(bytes.as_slice())?;
+    let dev = Device::finish_link(&session.db, &approval, &signed)?;
+    println!("Linked as device {} of user {} on {}.", dev.device_id, short(&dev.user), relay_host(&relay_url)?);
+    register(&session, rt, &relay_url, None)?;
+    println!("Next: for each repo, run `git e2ee send-history` on a device that has it, then clone it here.");
+    Ok(())
+}
+
+fn device_cmd(session: &Session, rt: &tokio::runtime::Runtime, cmd: DeviceCmd, relay: Option<&str>) -> Result<()> {
+    match cmd {
+        DeviceCmd::Link { .. } | DeviceCmd::Finish { .. } => unreachable!(),
         DeviceCmd::Approve { link_code } => {
             let dev = session.device()?;
-            let (signed, approval, id) = dev.approve_link(&link_code)?;
+            let relay = match relay {
+                Some(r) => r.to_string(),
+                None => session.db.relays()?.into_iter().next().ok_or_else(|| anyhow!("this account isn't registered with its relay yet"))?,
+            };
+            let (signed, approval, id) = dev.approve_link(&link_code, &relay)?;
             publish(session, rt, &dev, &signed.encode_to_vec())?;
             println!("Approved as device {id}. On the new device run:\n  git e2ee device finish {approval}");
-        }
-        DeviceCmd::Finish { approval_code } => {
-            let dev = Device::finish_link(&session.db, &approval_code)?;
-            println!("Linked as device {} of user {}.", dev.device_id, hex::encode(&dev.user));
-            println!("Next: git e2ee register <relay-url>, then ask an existing device to run `git e2ee send-history`.");
         }
         DeviceCmd::Revoke { device_id } => {
             let dev = session.device()?;

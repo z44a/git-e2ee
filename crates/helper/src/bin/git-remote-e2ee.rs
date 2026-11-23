@@ -19,7 +19,9 @@ fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let url = args.get(2).or(args.get(1)).context("usage: git-remote-e2ee <remote> <url>")?.clone();
     let git_dir = std::env::var("GIT_DIR").context("GIT_DIR not set; this program is run by git")?;
-    let session = Session::open()?;
+    // Accounts are per relay: the remote's relay picks the account.
+    let (relay_url, _) = e2ee_core::engine::parse_url(&url)?;
+    let session = Session::open_existing(&relay_url)?;
     let rt = runtime()?;
     let mut eng = Engine::new(session.device()?, &url)?;
     let real = Git::new(git_dir);
